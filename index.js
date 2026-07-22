@@ -13,10 +13,10 @@ const port = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// Database
+// Database - معالجة خطأ SSL
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
 });
 
 // JWT Secret
@@ -62,6 +62,7 @@ app.get('/health', async (req, res) => {
     dbStatus = 'up';
   } catch (e) {
     dbStatus = e.message.includes('does not exist') ? 'no_tables' : 'down';
+    console.log('Health DB error:', e.message);
   }
   
   res.json({
@@ -77,7 +78,6 @@ app.get('/health', async (req, res) => {
 app.post('/register', async (req, res) => {
   const { username, password, displayName } = req.body;
   
-  // Validate
   if (!username || !password) {
     return res.status(400).json({ error: 'Username and password required' });
   }
@@ -91,13 +91,11 @@ app.post('/register', async (req, res) => {
   }
   
   try {
-    // Check if user exists
     const existing = await pool.query('SELECT username FROM users WHERE username = $1', [username]);
     if (existing.rows.length > 0) {
       return res.status(400).json({ error: 'Username already exists' });
     }
     
-    // Hash password and create user
     const hashed = await bcrypt.hash(password, 10);
     await pool.query(
       'INSERT INTO users (username, password, display_name) VALUES ($1, $2, $3)',
@@ -107,7 +105,7 @@ app.post('/register', async (req, res) => {
     const token = jwt.sign({ username }, JWT_SECRET);
     res.json({ token, username, displayName: displayName || username });
   } catch (e) {
-    console.error('Register error:', e);
+    console.error('Register error:', e.message);
     res.status(500).json({ error: 'Server error: ' + e.message });
   }
 });
@@ -138,7 +136,7 @@ app.post('/login', async (req, res) => {
       displayName: result.rows[0].display_name || username 
     });
   } catch (e) {
-    console.error('Login error:', e);
+    console.error('Login error:', e.message);
     res.status(500).json({ error: 'Server error: ' + e.message });
   }
 });
@@ -160,7 +158,7 @@ app.post('/messages', async (req, res) => {
     );
     res.json(result.rows);
   } catch (e) {
-    console.error('Messages error:', e);
+    console.error('Messages error:', e.message);
     res.status(500).json({ error: 'Server error: ' + e.message });
   }
 });
@@ -171,7 +169,7 @@ app.get('/users', async (req, res) => {
     const result = await pool.query('SELECT username, display_name FROM users ORDER BY username');
     res.json(result.rows);
   } catch (e) {
-    console.error('Users error:', e);
+    console.error('Users error:', e.message);
     res.status(500).json({ error: 'Server error: ' + e.message });
   }
 });
@@ -208,13 +206,11 @@ wss.on('connection', (ws) => {
           return;
         }
         
-        // Save to database
         await pool.query(
           'INSERT INTO messages (sender, receiver, content) VALUES ($1, $2, $3)',
           [username, receiver, content]
         );
         
-        // Send to receiver if online
         const receiverWs = clients.get(receiver);
         if (receiverWs && receiverWs.readyState === WebSocket.OPEN) {
           receiverWs.send(JSON.stringify({
@@ -225,14 +221,13 @@ wss.on('connection', (ws) => {
           }));
         }
         
-        // Confirm to sender
         ws.send(JSON.stringify({ 
           type: 'sent',
           timestamp: new Date().toISOString()
         }));
       }
     } catch (e) {
-      console.error('❌ WS error:', e);
+      console.error('❌ WS error:', e.message);
     }
   });
 
