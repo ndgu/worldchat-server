@@ -2,7 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
 const jwt = require('jsonwebtoken');
-const bcrypt = require('bcrypt');
+const bcrypt = require('bcryptjs');
 const WebSocket = require('ws');
 const http = require('http');
 
@@ -30,6 +30,7 @@ const initDB = async () => {
         id SERIAL PRIMARY KEY,
         username TEXT UNIQUE NOT NULL,
         password TEXT NOT NULL,
+        display_name TEXT,
         created_at TIMESTAMP DEFAULT NOW()
       );
     `);
@@ -43,52 +44,113 @@ const initDB = async () => {
       );
     `);
     console.log('✅ Database tables ready');
+    return true;
   } catch (err) {
-    console.error('❌ DB init error:', err);
+    console.error('❌ DB init error:', err.message);
+    return false;
   }
 };
-initDB();
 
-// Health check
-app.get('/health', (req, res) => {
-  res.json({ ok: true, service: 'worldchat' });
+// Health check with DB status
+app.get('/health', async (req, res) => {
+  let dbStatus = 'unknown';
+  let usersCount = 0;
+  
+  try {
+    const result = await pool.query('SELECT COUNT(*) FROM users');
+    usersCount = parseInt(result.rows[0].count);
+    dbStatus = 'up';
+  } catch (e) {
+    dbStatus = e.message.includes('does not exist') ? 'no_tables' : 'down';
+  }
+  
+  res.json({
+    ok: true,
+    service: 'worldchat',
+    version: '1.1.0',
+    db: dbStatus,
+    usersCount: usersCount
+  });
 });
 
 // Register
 app.post('/register', async (req, res) => {
-  const { username, password } = req.body;
+  const { username, password, displayName } = req.body;
+  
+  // Validate
+  if (!username || !password) {
+    return res.status(400).json({ error: 'Username and password required' });
+  }
+  
+  if (username.length < 3 || username.length > 20) {
+    return res.status(400).json({ error: 'Username must be 3-20 characters' });
+  }
+  
+  if (password.length < 4) {
+    return res.status(400).json({ error: 'Password must be at least 4 characters' });
+  }
+  
   try {
+    // Check if user exists
+    const existing = await pool.query('SELECT username FROM users WHERE username = $1', [username]);
+    if (existing.rows.length > 0) {
+      return res.status(400).json({ error: 'Username already exists' });
+    }
+    
+    // Hash password and create user
     const hashed = await bcrypt.hash(password, 10);
-    await pool.query('INSERT INTO users (username, password) VALUES ($1, $2)', [username, hashed]);
+    await pool.query(
+      'INSERT INTO users (username, password, display_name) VALUES ($1, $2, $3)',
+      [username, hashed, displayName || username]
+    );
+    
     const token = jwt.sign({ username }, JWT_SECRET);
-    res.json({ token, username });
+    res.json({ token, username, displayName: displayName || username });
   } catch (e) {
-    res.status(400).json({ error: 'Username already exists' });
+    console.error('Register error:', e);
+    res.status(500).json({ error: 'Server error: ' + e.message });
   }
 });
 
 // Login
 app.post('/login', async (req, res) => {
   const { username, password } = req.body;
+  
+  if (!username || !password) {
+    return res.status(400).json({ error: 'Username and password required' });
+  }
+  
   try {
     const result = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
     if (result.rows.length === 0) {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
+    
     const valid = await bcrypt.compare(password, result.rows[0].password);
     if (!valid) {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
+    
     const token = jwt.sign({ username }, JWT_SECRET);
-    res.json({ token, username });
+    res.json({ 
+      token, 
+      username, 
+      displayName: result.rows[0].display_name || username 
+    });
   } catch (e) {
-    res.status(500).json({ error: 'Server error' });
+    console.error('Login error:', e);
+    res.status(500).json({ error: 'Server error: ' + e.message });
   }
 });
 
-// Get messages between two users
+// Get messages
 app.post('/messages', async (req, res) => {
   const { myUsername, otherUsername } = req.body;
+  
+  if (!myUsername || !otherUsername) {
+    return res.status(400).json({ error: 'Both usernames required' });
+  }
+  
   try {
     const result = await pool.query(
       `SELECT * FROM messages WHERE 
@@ -98,17 +160,19 @@ app.post('/messages', async (req, res) => {
     );
     res.json(result.rows);
   } catch (e) {
-    res.status(500).json({ error: 'Server error' });
+    console.error('Messages error:', e);
+    res.status(500).json({ error: 'Server error: ' + e.message });
   }
 });
 
 // Get all users
 app.get('/users', async (req, res) => {
   try {
-    const result = await pool.query('SELECT username FROM users ORDER BY username');
+    const result = await pool.query('SELECT username, display_name FROM users ORDER BY username');
     res.json(result.rows);
   } catch (e) {
-    res.status(500).json({ error: 'Server error' });
+    console.error('Users error:', e);
+    res.status(500).json({ error: 'Server error: ' + e.message });
   }
 });
 
@@ -139,6 +203,10 @@ wss.on('connection', (ws) => {
       
       if (data.type === 'message' && username) {
         const { receiver, content } = data;
+        
+        if (!receiver || !content) {
+          return;
+        }
         
         // Save to database
         await pool.query(
@@ -176,6 +244,17 @@ wss.on('connection', (ws) => {
   });
 });
 
-server.listen(port, () => {
-  console.log(`🚀 Server running on port ${port}`);
-});
+// Start server
+const startServer = async () => {
+  const dbReady = await initDB();
+  if (!dbReady) {
+    console.log('⚠️ Database not ready, but server will start');
+  }
+  
+  server.listen(port, () => {
+    console.log(`🚀 Server running on port ${port}`);
+    console.log(`📊 DB Status: ${dbReady ? 'ready' : 'not ready'}`);
+  });
+};
+
+startServer();
