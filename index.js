@@ -13,9 +13,12 @@ const port = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// Database Connection - مع إعدادات اتصال محسنة
+// 🔥 جبر DATABASE_URL من متغيرات Railway
+const DATABASE_URL = process.env.DATABASE_URL;
+
+// Database Connection - مع جبر قوي
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
+  connectionString: DATABASE_URL,
   ssl: {
     rejectUnauthorized: false
   },
@@ -25,7 +28,7 @@ const pool = new Pool({
 });
 
 // JWT Secret
-const JWT_SECRET = process.env.JWT_SECRET || 'fallback_secret_change_this';
+const JWT_SECRET = process.env.JWT_SECRET || 'worldchat_super_secret_key_2026_ahmed_12345';
 
 // Create tables
 const initDB = async () => {
@@ -60,9 +63,9 @@ const initDB = async () => {
 app.get('/health', async (req, res) => {
   let dbStatus = 'unknown';
   let usersCount = 0;
+  let dbUrlStatus = DATABASE_URL ? 'set' : 'missing';
   
   try {
-    // محاولة الاتصال بقاعدة البيانات
     const client = await pool.connect();
     try {
       const result = await client.query('SELECT COUNT(*) FROM users');
@@ -82,7 +85,8 @@ app.get('/health', async (req, res) => {
     version: '1.1.0',
     db: dbStatus,
     usersCount: usersCount,
-    database_url: process.env.DATABASE_URL ? 'set' : 'missing'
+    database_url: dbUrlStatus,
+    db_url_length: DATABASE_URL ? DATABASE_URL.length : 0
   });
 });
 
@@ -105,13 +109,11 @@ app.post('/register', async (req, res) => {
   try {
     const client = await pool.connect();
     try {
-      // Check if user exists
       const existing = await client.query('SELECT username FROM users WHERE username = $1', [username]);
       if (existing.rows.length > 0) {
         return res.status(400).json({ error: 'Username already exists' });
       }
       
-      // Hash password and create user
       const hashed = await bcrypt.hash(password, 10);
       await client.query(
         'INSERT INTO users (username, password, display_name) VALUES ($1, $2, $3)',
@@ -255,7 +257,6 @@ wss.on('connection', (ws) => {
           console.error('Save message error:', e.message);
         }
         
-        // Send to receiver if online
         const receiverWs = clients.get(receiver);
         if (receiverWs && receiverWs.readyState === WebSocket.OPEN) {
           receiverWs.send(JSON.stringify({
@@ -287,8 +288,8 @@ wss.on('connection', (ws) => {
 // Start server
 const startServer = async () => {
   console.log('🚀 Starting server...');
-  console.log('📡 DATABASE_URL:', process.env.DATABASE_URL ? 'Set ✅' : 'Missing ❌');
-  console.log('🔐 JWT_SECRET:', process.env.JWT_SECRET ? 'Set ✅' : 'Missing ❌');
+  console.log('📡 DATABASE_URL:', DATABASE_URL ? 'Set ✅ (length: ' + DATABASE_URL.length + ')' : 'Missing ❌');
+  console.log('🔐 JWT_SECRET:', JWT_SECRET ? 'Set ✅' : 'Missing ❌');
   
   const dbReady = await initDB();
   if (!dbReady) {
