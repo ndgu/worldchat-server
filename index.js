@@ -13,10 +13,15 @@ const port = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// Database - معالجة خطأ SSL
+// Database Connection - مع إعدادات اتصال محسنة
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+  ssl: {
+    rejectUnauthorized: false
+  },
+  connectionTimeoutMillis: 10000,
+  idleTimeoutMillis: 30000,
+  max: 20
 });
 
 // JWT Secret
@@ -57,12 +62,18 @@ app.get('/health', async (req, res) => {
   let usersCount = 0;
   
   try {
-    const result = await pool.query('SELECT COUNT(*) FROM users');
-    usersCount = parseInt(result.rows[0].count);
-    dbStatus = 'up';
+    // محاولة الاتصال بقاعدة البيانات
+    const client = await pool.connect();
+    try {
+      const result = await client.query('SELECT COUNT(*) FROM users');
+      usersCount = parseInt(result.rows[0].count);
+      dbStatus = 'up';
+    } finally {
+      client.release();
+    }
   } catch (e) {
-    dbStatus = e.message.includes('does not exist') ? 'no_tables' : 'down';
-    console.log('Health DB error:', e.message);
+    console.error('Health DB error:', e.message);
+    dbStatus = 'down';
   }
   
   res.json({
@@ -70,7 +81,8 @@ app.get('/health', async (req, res) => {
     service: 'worldchat',
     version: '1.1.0',
     db: dbStatus,
-    usersCount: usersCount
+    usersCount: usersCount,
+    database_url: process.env.DATABASE_URL ? 'set' : 'missing'
   });
 });
 
@@ -91,19 +103,26 @@ app.post('/register', async (req, res) => {
   }
   
   try {
-    const existing = await pool.query('SELECT username FROM users WHERE username = $1', [username]);
-    if (existing.rows.length > 0) {
-      return res.status(400).json({ error: 'Username already exists' });
+    const client = await pool.connect();
+    try {
+      // Check if user exists
+      const existing = await client.query('SELECT username FROM users WHERE username = $1', [username]);
+      if (existing.rows.length > 0) {
+        return res.status(400).json({ error: 'Username already exists' });
+      }
+      
+      // Hash password and create user
+      const hashed = await bcrypt.hash(password, 10);
+      await client.query(
+        'INSERT INTO users (username, password, display_name) VALUES ($1, $2, $3)',
+        [username, hashed, displayName || username]
+      );
+      
+      const token = jwt.sign({ username }, JWT_SECRET);
+      res.json({ token, username, displayName: displayName || username });
+    } finally {
+      client.release();
     }
-    
-    const hashed = await bcrypt.hash(password, 10);
-    await pool.query(
-      'INSERT INTO users (username, password, display_name) VALUES ($1, $2, $3)',
-      [username, hashed, displayName || username]
-    );
-    
-    const token = jwt.sign({ username }, JWT_SECRET);
-    res.json({ token, username, displayName: displayName || username });
   } catch (e) {
     console.error('Register error:', e.message);
     res.status(500).json({ error: 'Server error: ' + e.message });
@@ -119,22 +138,27 @@ app.post('/login', async (req, res) => {
   }
   
   try {
-    const result = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
-    if (result.rows.length === 0) {
-      return res.status(401).json({ error: 'Invalid credentials' });
+    const client = await pool.connect();
+    try {
+      const result = await client.query('SELECT * FROM users WHERE username = $1', [username]);
+      if (result.rows.length === 0) {
+        return res.status(401).json({ error: 'Invalid credentials' });
+      }
+      
+      const valid = await bcrypt.compare(password, result.rows[0].password);
+      if (!valid) {
+        return res.status(401).json({ error: 'Invalid credentials' });
+      }
+      
+      const token = jwt.sign({ username }, JWT_SECRET);
+      res.json({ 
+        token, 
+        username, 
+        displayName: result.rows[0].display_name || username 
+      });
+    } finally {
+      client.release();
     }
-    
-    const valid = await bcrypt.compare(password, result.rows[0].password);
-    if (!valid) {
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
-    
-    const token = jwt.sign({ username }, JWT_SECRET);
-    res.json({ 
-      token, 
-      username, 
-      displayName: result.rows[0].display_name || username 
-    });
   } catch (e) {
     console.error('Login error:', e.message);
     res.status(500).json({ error: 'Server error: ' + e.message });
@@ -150,13 +174,18 @@ app.post('/messages', async (req, res) => {
   }
   
   try {
-    const result = await pool.query(
-      `SELECT * FROM messages WHERE 
-       (sender = $1 AND receiver = $2) OR (sender = $2 AND receiver = $1)
-       ORDER BY timestamp ASC`,
-      [myUsername, otherUsername]
-    );
-    res.json(result.rows);
+    const client = await pool.connect();
+    try {
+      const result = await client.query(
+        `SELECT * FROM messages WHERE 
+         (sender = $1 AND receiver = $2) OR (sender = $2 AND receiver = $1)
+         ORDER BY timestamp ASC`,
+        [myUsername, otherUsername]
+      );
+      res.json(result.rows);
+    } finally {
+      client.release();
+    }
   } catch (e) {
     console.error('Messages error:', e.message);
     res.status(500).json({ error: 'Server error: ' + e.message });
@@ -166,8 +195,13 @@ app.post('/messages', async (req, res) => {
 // Get all users
 app.get('/users', async (req, res) => {
   try {
-    const result = await pool.query('SELECT username, display_name FROM users ORDER BY username');
-    res.json(result.rows);
+    const client = await pool.connect();
+    try {
+      const result = await client.query('SELECT username, display_name FROM users ORDER BY username');
+      res.json(result.rows);
+    } finally {
+      client.release();
+    }
   } catch (e) {
     console.error('Users error:', e.message);
     res.status(500).json({ error: 'Server error: ' + e.message });
@@ -196,6 +230,7 @@ wss.on('connection', (ws) => {
           console.log(`✅ ${username} connected`);
         } catch (e) {
           ws.send(JSON.stringify({ type: 'auth_fail' }));
+          console.error('Auth error:', e.message);
         }
       }
       
@@ -206,11 +241,21 @@ wss.on('connection', (ws) => {
           return;
         }
         
-        await pool.query(
-          'INSERT INTO messages (sender, receiver, content) VALUES ($1, $2, $3)',
-          [username, receiver, content]
-        );
+        try {
+          const client = await pool.connect();
+          try {
+            await client.query(
+              'INSERT INTO messages (sender, receiver, content) VALUES ($1, $2, $3)',
+              [username, receiver, content]
+            );
+          } finally {
+            client.release();
+          }
+        } catch (e) {
+          console.error('Save message error:', e.message);
+        }
         
+        // Send to receiver if online
         const receiverWs = clients.get(receiver);
         if (receiverWs && receiverWs.readyState === WebSocket.OPEN) {
           receiverWs.send(JSON.stringify({
@@ -241,6 +286,10 @@ wss.on('connection', (ws) => {
 
 // Start server
 const startServer = async () => {
+  console.log('🚀 Starting server...');
+  console.log('📡 DATABASE_URL:', process.env.DATABASE_URL ? 'Set ✅' : 'Missing ❌');
+  console.log('🔐 JWT_SECRET:', process.env.JWT_SECRET ? 'Set ✅' : 'Missing ❌');
+  
   const dbReady = await initDB();
   if (!dbReady) {
     console.log('⚠️ Database not ready, but server will start');
@@ -248,7 +297,7 @@ const startServer = async () => {
   
   server.listen(port, () => {
     console.log(`🚀 Server running on port ${port}`);
-    console.log(`📊 DB Status: ${dbReady ? 'ready' : 'not ready'}`);
+    console.log(`📊 DB Status: ${dbReady ? 'ready ✅' : 'not ready ❌'}`);
   });
 };
 
