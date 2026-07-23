@@ -78,7 +78,7 @@ const initDB = async () => {
       );
     `);
 
-    console.log('✅ Database tables ready (v2.4.0)');
+    console.log('✅ Database tables ready (v2.5.0)');
     return true;
   } catch (err) {
     console.error('❌ DB init error:', err.message);
@@ -107,10 +107,10 @@ app.get('/health', async (req, res) => {
   res.json({
     ok: true,
     service: 'worldchat',
-    version: '2.4.0',
+    version: '2.5.0',
     db: dbStatus,
     usersCount: usersCount,
-    features: ['chat', 'media', 'profile', 'calls']
+    features: ['chat', 'media', 'profile', 'calls', 'offline_inbox']
   });
 });
 
@@ -305,6 +305,45 @@ app.get('/users/search', async (req, res) => {
   }
 });
 
+// ============ جلب جميع رسائل المستخدم (Inbox) ============
+app.get('/inbox', async (req, res) => {
+  const token = req.headers.authorization?.split(' ')[1];
+  
+  if (!token) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const username = decoded.username;
+    
+    const client = await pool.connect();
+    try {
+      // جلب جميع الرسائل التي تخص هذا المستخدم (مرسلة أو مستقبلة)
+      const result = await client.query(
+        `SELECT * FROM messages WHERE 
+         sender = $1 OR receiver = $1
+         ORDER BY timestamp DESC LIMIT 500`,
+        [username]
+      );
+      
+      // تحديث حالة delivered للرسائل المستقبلة
+      await client.query(
+        `UPDATE messages SET delivered = TRUE 
+         WHERE receiver = $1 AND delivered = FALSE`,
+        [username]
+      );
+      
+      res.json(result.rows.reverse());
+    } finally {
+      client.release();
+    }
+  } catch (e) {
+    console.error('Inbox error:', e.message);
+    res.status(500).json({ error: 'Server error: ' + e.message });
+  }
+});
+
 // ============ جلب رسائل المحادثة ============
 app.post('/messages', async (req, res) => {
   const { myUsername, otherUsername, limit = 50, offset = 0 } = req.body;
@@ -360,12 +399,17 @@ app.post('/messages/send', async (req, res) => {
       );
       
       // إرسال عبر WebSocket للمستقبل إذا كان متصلاً
-      const receiverWs = clients.get(receiver);
-      if (receiverWs && receiverWs.readyState === WebSocket.OPEN) {
-        receiverWs.send(JSON.stringify({
+      const receiverSockets = clients.get(receiver);
+      if (receiverSockets) {
+        const messageData = JSON.stringify({
           type: 'message',
           ...result.rows[0]
-        }));
+        });
+        receiverSockets.forEach((socket) => {
+          if (socket.readyState === WebSocket.OPEN) {
+            socket.send(messageData);
+          }
+        });
       }
       
       res.json(result.rows[0]);
@@ -378,8 +422,9 @@ app.post('/messages/send', async (req, res) => {
   }
 });
 
-// ============ إرسال رسالة (HTTP بديل) ============
+// ============ إرسال رسالة (بديل) ============
 app.post('/send-message', async (req, res) => {
+  // نفس المنطق أعلاه
   const { sender, receiver, content, mediaType, mediaUrl, replyTo } = req.body;
   const token = req.headers.authorization?.split(' ')[1];
   
@@ -405,12 +450,17 @@ app.post('/send-message', async (req, res) => {
         [sender, receiver, content || null, mediaType || null, mediaUrl || null, replyTo || null]
       );
       
-      const receiverWs = clients.get(receiver);
-      if (receiverWs && receiverWs.readyState === WebSocket.OPEN) {
-        receiverWs.send(JSON.stringify({
+      const receiverSockets = clients.get(receiver);
+      if (receiverSockets) {
+        const messageData = JSON.stringify({
           type: 'message',
           ...result.rows[0]
-        }));
+        });
+        receiverSockets.forEach((socket) => {
+          if (socket.readyState === WebSocket.OPEN) {
+            socket.send(messageData);
+          }
+        });
       }
       
       res.json(result.rows[0]);
@@ -423,8 +473,9 @@ app.post('/send-message', async (req, res) => {
   }
 });
 
-// ============ إرسال رسالة (HTTP بديل آخر) ============
+// ============ إرسال رسالة (بديل آخر) ============
 app.post('/chat/send', async (req, res) => {
+  // نفس المنطق أعلاه
   const { sender, receiver, content, mediaType, mediaUrl, replyTo } = req.body;
   const token = req.headers.authorization?.split(' ')[1];
   
@@ -450,12 +501,17 @@ app.post('/chat/send', async (req, res) => {
         [sender, receiver, content || null, mediaType || null, mediaUrl || null, replyTo || null]
       );
       
-      const receiverWs = clients.get(receiver);
-      if (receiverWs && receiverWs.readyState === WebSocket.OPEN) {
-        receiverWs.send(JSON.stringify({
+      const receiverSockets = clients.get(receiver);
+      if (receiverSockets) {
+        const messageData = JSON.stringify({
           type: 'message',
           ...result.rows[0]
-        }));
+        });
+        receiverSockets.forEach((socket) => {
+          if (socket.readyState === WebSocket.OPEN) {
+            socket.send(messageData);
+          }
+        });
       }
       
       res.json(result.rows[0]);
@@ -534,13 +590,18 @@ app.post('/webrtc', async (req, res) => {
       );
     }
     
-    const targetWs = clients.get(to);
-    if (targetWs && targetWs.readyState === WebSocket.OPEN) {
-      targetWs.send(JSON.stringify({
+    const receiverSockets = clients.get(to);
+    if (receiverSockets) {
+      const signalData = JSON.stringify({
         type: 'webrtc',
         from: from,
         signal: data
-      }));
+      });
+      receiverSockets.forEach((socket) => {
+        if (socket.readyState === WebSocket.OPEN) {
+          socket.send(signalData);
+        }
+      });
     }
     
     res.json({ success: true });
@@ -553,7 +614,7 @@ app.post('/webrtc', async (req, res) => {
 // ============ WebSocket Server ============
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
-const clients = new Map(); // username -> Set of WebSockets (يدعم عدة أجهزة)
+const clients = new Map(); // username -> Set of WebSockets
 
 wss.on('connection', (ws) => {
   let username = null;
@@ -576,6 +637,44 @@ wss.on('connection', (ws) => {
           
           ws.send(JSON.stringify({ type: 'auth_ok' }));
           console.log(`✅ ${username} connected (${clients.get(username).size} devices)`);
+          
+          // ==== إرسال البريد الوارد (Inbox) عند الاتصال ====
+          try {
+            const client = await pool.connect();
+            try {
+              // جلب الرسائل غير المقروءة للمستقبل
+              const result = await client.query(
+                `SELECT * FROM messages WHERE 
+                 receiver = $1 AND read = FALSE
+                 ORDER BY timestamp ASC`,
+                [username]
+              );
+              
+              if (result.rows.length > 0) {
+                console.log(`📬 Sending ${result.rows.length} offline messages to ${username}`);
+                
+                // إرسال كل رسالة على حدة
+                result.rows.forEach((msg) => {
+                  ws.send(JSON.stringify({
+                    type: 'message',
+                    ...msg
+                  }));
+                });
+                
+                // تحديث حالة delivered
+                await client.query(
+                  `UPDATE messages SET delivered = TRUE 
+                   WHERE receiver = $1 AND delivered = FALSE`,
+                  [username]
+                );
+              }
+            } finally {
+              client.release();
+            }
+          } catch (e) {
+            console.error('Inbox delivery error:', e.message);
+          }
+          
           broadcastOnlineUsers();
         } catch (e) {
           ws.send(JSON.stringify({ type: 'auth_fail' }));
@@ -597,7 +696,7 @@ wss.on('connection', (ws) => {
             [username, receiver, content || null, mediaType || null, mediaUrl || null, replyTo || null]
           );
           
-          // إرسال للمستقبل إذا كان متصلاً (جميع أجهزته)
+          // إرسال للمستقبل إذا كان متصلاً
           const receiverSockets = clients.get(receiver);
           if (receiverSockets) {
             const messageData = JSON.stringify({
@@ -697,7 +796,7 @@ function broadcastOnlineUsers() {
 
 // ============ تشغيل السيرفر ============
 const startServer = async () => {
-  console.log('🚀 Starting WorldChat Server v2.4.0...');
+  console.log('🚀 Starting WorldChat Server v2.5.0...');
   console.log('📡 DATABASE_URL:', DATABASE_URL ? 'Set ✅' : 'Missing ❌');
   console.log('🔐 JWT_SECRET:', JWT_SECRET ? 'Set ✅' : 'Missing ❌');
   
@@ -706,8 +805,9 @@ const startServer = async () => {
   server.listen(port, () => {
     console.log(`🚀 Server running on port ${port}`);
     console.log(`📊 DB Status: ${dbReady ? 'ready ✅' : 'not ready ❌'}`);
-    console.log('✨ Features: chat, media, profile, calls');
+    console.log('✨ Features: chat, media, profile, calls, offline_inbox');
     console.log('👥 Multi-device support: enabled');
+    console.log('📬 Offline Inbox: enabled');
   });
 };
 
