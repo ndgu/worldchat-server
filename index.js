@@ -8,40 +8,6 @@ const http = require('http');
 const multer = require('multer');
 const { v4: uuidv4 } = require('uuid');
 
-// ============ Firebase Admin SDK ============
-const admin = require('firebase-admin');
-
-// تهيئة Firebase من متغيرات البيئة
-if (!admin.apps.length) {
-  try {
-    // محاولة استخدام متغيرات البيئة
-    const serviceAccount = {
-      type: "service_account",
-      project_id: process.env.FIREBASE_PROJECT_ID,
-      private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID,
-      private_key: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
-      client_email: process.env.FIREBASE_CLIENT_EMAIL,
-      client_id: process.env.FIREBASE_CLIENT_ID,
-      auth_uri: "https://accounts.google.com/o/oauth2/auth",
-      token_uri: "https://oauth2.googleapis.com/token",
-      auth_provider_x509_cert_url: "https://www.googleapis.com/oauth2/v1/certs",
-      client_x509_cert_url: process.env.FIREBASE_CLIENT_CERT_URL
-    };
-
-    admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount),
-      storageBucket: process.env.FIREBASE_STORAGE_BUCKET || 'worldchat-cde0b.appspot.com'
-    });
-    console.log('🔥 Firebase Admin initialized successfully');
-  } catch (e) {
-    console.log('⚠️ Firebase Admin init error:', e.message);
-  }
-}
-
-const bucket = admin.storage().bucket();
-const fcm = admin.messaging();
-
-// ============ Express App ============
 const app = express();
 const port = process.env.PORT || 3000;
 
@@ -62,10 +28,72 @@ const pool = new Pool({
 
 const JWT_SECRET = process.env.JWT_SECRET || 'worldchat_super_secret_key_2026_ahmed_12345';
 
+// ============================================================
+// ============ FIREBASE ADMIN SDK (المُصلح) ============
+// ============================================================
+
+let admin = null;
+let bucket = null;
+let fcm = null;
+let firebaseInitialized = false;
+
+try {
+  admin = require('firebase-admin');
+  
+  const projectId = process.env.FIREBASE_PROJECT_ID;
+  const privateKey = process.env.FIREBASE_PRIVATE_KEY;
+  const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
+  
+  console.log('📡 Checking Firebase variables...');
+  console.log('  - FIREBASE_PROJECT_ID:', projectId ? '✅ Set' : '❌ Missing');
+  console.log('  - FIREBASE_PRIVATE_KEY:', privateKey ? '✅ Set (' + privateKey.length + ' chars)' : '❌ Missing');
+  console.log('  - FIREBASE_CLIENT_EMAIL:', clientEmail ? '✅ Set' : '❌ Missing');
+  
+  if (projectId && privateKey && clientEmail) {
+    console.log('🔥 Initializing Firebase Admin...');
+    
+    let formattedPrivateKey = privateKey;
+    if (formattedPrivateKey.includes('\\n')) {
+      formattedPrivateKey = formattedPrivateKey.replace(/\\n/g, '\n');
+    }
+    
+    const serviceAccount = {
+      type: "service_account",
+      project_id: projectId,
+      private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID || "",
+      private_key: formattedPrivateKey,
+      client_email: clientEmail,
+      client_id: process.env.FIREBASE_CLIENT_ID || "",
+      auth_uri: "https://accounts.google.com/o/oauth2/auth",
+      token_uri: "https://oauth2.googleapis.com/token",
+      auth_provider_x509_cert_url: "https://www.googleapis.com/oauth2/v1/certs",
+      client_x509_cert_url: process.env.FIREBASE_CLIENT_CERT_URL || ""
+    };
+
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount),
+      storageBucket: process.env.FIREBASE_STORAGE_BUCKET || 'worldchat-cde0b.firebasestorage.app'
+    });
+    
+    bucket = admin.storage().bucket();
+    fcm = admin.messaging();
+    firebaseInitialized = true;
+    console.log('✅ Firebase Admin initialized successfully!');
+    console.log('📦 Storage Bucket:', bucket.name);
+  } else {
+    console.log('⚠️ Firebase variables missing - FCM and Storage disabled');
+  }
+} catch (e) {
+  console.log('❌ Firebase init error:', e.message);
+  firebaseInitialized = false;
+}
+
+// ============================================================
 // ============ إنشاء الجداول ============
+// ============================================================
+
 const initDB = async () => {
   try {
-    // جدول users
     await pool.query(`
       CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
@@ -80,7 +108,6 @@ const initDB = async () => {
       );
     `);
 
-    // إضافة الأعمدة المفقودة
     const userColumns = ['display_name', 'avatar', 'profile_pic', 'is_online', 'last_seen'];
     for (const col of userColumns) {
       try {
@@ -90,7 +117,6 @@ const initDB = async () => {
       } catch (e) { /* العمود موجود */ }
     }
 
-    // جدول messages
     await pool.query(`
       CREATE TABLE IF NOT EXISTS messages (
         id SERIAL PRIMARY KEY,
@@ -106,7 +132,6 @@ const initDB = async () => {
       );
     `);
 
-    // إضافة الأعمدة المفقودة في messages
     const msgColumns = [
       { name: 'media_type', type: 'TEXT' },
       { name: 'media_url', type: 'TEXT' },
@@ -120,7 +145,6 @@ const initDB = async () => {
       } catch (e) { /* العمود موجود */ }
     }
 
-    // جدول calls
     await pool.query(`
       CREATE TABLE IF NOT EXISTS calls (
         id SERIAL PRIMARY KEY,
@@ -133,7 +157,6 @@ const initDB = async () => {
       );
     `);
 
-    // جدول devices (لـ FCM)
     await pool.query(`
       CREATE TABLE IF NOT EXISTS devices (
         id SERIAL PRIMARY KEY,
@@ -144,7 +167,7 @@ const initDB = async () => {
       );
     `);
 
-    console.log('✅ Database tables ready (v2.7.0)');
+    console.log('✅ Database tables ready');
     return true;
   } catch (err) {
     console.error('❌ DB init error:', err.message);
@@ -152,8 +175,16 @@ const initDB = async () => {
   }
 };
 
-// ============ FCM دالة إرسال الإشعارات ============
+// ============================================================
+// ============ FCM - إرسال الإشعارات ============
+// ============================================================
+
 const sendFCMNotification = async (toUsername, title, body, data = {}) => {
+  if (!firebaseInitialized || !fcm) {
+    console.log('ℹ️ Firebase not initialized, skipping notification to', toUsername);
+    return;
+  }
+  
   try {
     const client = await pool.connect();
     try {
@@ -187,9 +218,8 @@ const sendFCMNotification = async (toUsername, title, body, data = {}) => {
       };
 
       const response = await fcm.sendEachForMulticast(message);
-      console.log(`📨 FCM sent: ${response.successCount} delivered`);
+      console.log(`📨 FCM sent to ${toUsername}: ${response.successCount} delivered`);
 
-      // تنظيف التوكنات غير الصالحة
       const staleTokens = [];
       response.responses.forEach((resp, index) => {
         if (resp.error && resp.error.message.includes('registration-token-not-registered')) {
@@ -217,7 +247,10 @@ const sendFCMNotification = async (toUsername, title, body, data = {}) => {
   }
 };
 
-// ============ Health Check ============
+// ============================================================
+// ============ HEALTH CHECK ============
+// ============================================================
+
 app.get('/health', async (req, res) => {
   let dbStatus = 'unknown';
   let usersCount = 0;
@@ -241,11 +274,15 @@ app.get('/health', async (req, res) => {
     version: '2.7.0',
     db: dbStatus,
     usersCount: usersCount,
-    features: ['chat', 'media', 'profile', 'calls', 'offline_inbox', 'background_support']
+    features: ['chat', 'media', 'profile', 'calls', 'offline_inbox', 'background_support'],
+    firebase: firebaseInitialized ? 'connected' : 'disabled'
   });
 });
 
-// ============ Upload to Firebase Storage ============
+// ============================================================
+// ============ UPLOAD - رفع الملفات إلى Firebase Storage ============
+// ============================================================
+
 const upload = multer({ storage: multer.memoryStorage() });
 
 app.post('/upload', upload.single('file'), async (req, res) => {
@@ -263,6 +300,10 @@ app.post('/upload', upload.single('file'), async (req, res) => {
       return res.status(400).json({ error: 'No file uploaded' });
     }
 
+    if (!firebaseInitialized || !bucket) {
+      return res.status(503).json({ error: 'Firebase storage not available' });
+    }
+
     const fileName = `uploads/${username}/${Date.now()}-${req.file.originalname}`;
     const file = bucket.file(fileName);
 
@@ -276,16 +317,21 @@ app.post('/upload', upload.single('file'), async (req, res) => {
     });
 
     stream.on('finish', async () => {
-      const [url] = await file.getSignedUrl({
-        action: 'read',
-        expires: Date.now() + 7 * 24 * 60 * 60 * 1000
-      });
-      
-      res.json({
-        success: true,
-        fileUrl: url,
-        fileName: fileName
-      });
+      try {
+        const [url] = await file.getSignedUrl({
+          action: 'read',
+          expires: Date.now() + 7 * 24 * 60 * 60 * 1000
+        });
+        
+        res.json({
+          success: true,
+          fileUrl: url,
+          fileName: fileName
+        });
+      } catch (e) {
+        console.error('Sign URL error:', e);
+        res.status(500).json({ error: 'Failed to generate URL' });
+      }
     });
 
     stream.end(req.file.buffer);
@@ -295,7 +341,10 @@ app.post('/upload', upload.single('file'), async (req, res) => {
   }
 });
 
-// ============ Device Registration (FCM) ============
+// ============================================================
+// ============ DEVICE REGISTRATION (FCM) ============
+// ============================================================
+
 app.post('/device/register', async (req, res) => {
   const { username, fcmToken, platform } = req.body;
   const token = req.headers.authorization?.split(' ')[1];
@@ -332,7 +381,6 @@ app.post('/device/register', async (req, res) => {
   }
 });
 
-// ============ Device Unregister ============
 app.delete('/device/unregister', async (req, res) => {
   const { fcmToken } = req.body;
   const token = req.headers.authorization?.split(' ')[1];
@@ -355,7 +403,10 @@ app.delete('/device/unregister', async (req, res) => {
   }
 });
 
-// ============ Register ============
+// ============================================================
+// ============ AUTH ROUTES ============
+// ============================================================
+
 app.post('/register', async (req, res) => {
   const { username, password, displayName, profilePic } = req.body;
   
@@ -397,7 +448,6 @@ app.post('/register', async (req, res) => {
   }
 });
 
-// ============ Login ============
 app.post('/login', async (req, res) => {
   const { username, password } = req.body;
   
@@ -439,7 +489,6 @@ app.post('/login', async (req, res) => {
   }
 });
 
-// ============ Update Profile ============
 app.post('/update-profile', async (req, res) => {
   const { username, displayName, profilePic, password } = req.body;
   const token = req.headers.authorization?.split(' ')[1];
@@ -479,7 +528,6 @@ app.post('/update-profile', async (req, res) => {
   }
 });
 
-// ============ Get Me ============
 app.get('/me', async (req, res) => {
   const token = req.headers.authorization?.split(' ')[1];
   
@@ -509,7 +557,6 @@ app.get('/me', async (req, res) => {
   }
 });
 
-// ============ Get Users ============
 app.get('/users', async (req, res) => {
   try {
     const client = await pool.connect();
@@ -528,7 +575,6 @@ app.get('/users', async (req, res) => {
   }
 });
 
-// ============ Search Users ============
 app.get('/users/search', async (req, res) => {
   const { username } = req.query;
   
@@ -556,7 +602,10 @@ app.get('/users/search', async (req, res) => {
   }
 });
 
-// ============ Inbox ============
+// ============================================================
+// ============ MESSAGES ============
+// ============================================================
+
 app.get('/inbox', async (req, res) => {
   const token = req.headers.authorization?.split(' ')[1];
   
@@ -593,7 +642,6 @@ app.get('/inbox', async (req, res) => {
   }
 });
 
-// ============ Get Messages ============
 app.post('/messages', async (req, res) => {
   const { myUsername, otherUsername, limit = 50, offset = 0 } = req.body;
   
@@ -620,7 +668,6 @@ app.post('/messages', async (req, res) => {
   }
 });
 
-// ============ Send Message (HTTP) ============
 app.post('/messages/send', async (req, res) => {
   const { sender, receiver, content, mediaType, mediaUrl, replyTo } = req.body;
   const token = req.headers.authorization?.split(' ')[1];
@@ -647,9 +694,8 @@ app.post('/messages/send', async (req, res) => {
         [sender, receiver, content || null, mediaType || null, mediaUrl || null, replyTo || null]
       );
       
-      // Send via WebSocket
       const receiverSockets = clients.get(receiver);
-      if (receiverSockets) {
+      if (receiverSockets && receiverSockets.size > 0) {
         const messageData = JSON.stringify({
           type: 'message',
           ...result.rows[0]
@@ -660,7 +706,6 @@ app.post('/messages/send', async (req, res) => {
           }
         });
       } else {
-        // Send FCM notification if user offline
         await sendFCMNotification(
           receiver,
           sender,
@@ -668,7 +713,7 @@ app.post('/messages/send', async (req, res) => {
           {
             type: 'message',
             sender: sender,
-            messageId: result.rows[0].id
+            messageId: String(result.rows[0].id)
           }
         );
       }
@@ -683,7 +728,6 @@ app.post('/messages/send', async (req, res) => {
   }
 });
 
-// ============ Mark Messages as Read ============
 app.post('/messages/read', async (req, res) => {
   const { username, otherUsername } = req.body;
   const token = req.headers.authorization?.split(' ')[1];
@@ -715,9 +759,10 @@ app.post('/messages/read', async (req, res) => {
   }
 });
 
-// ============ Call Routes ============
+// ============================================================
+// ============ CALLS (WebRTC) ============
+// ============================================================
 
-// Start Call
 app.post('/call/start', async (req, res) => {
   const { from, to, offer, isVideo } = req.body;
   const token = req.headers.authorization?.split(' ')[1];
@@ -749,7 +794,6 @@ app.post('/call/start', async (req, res) => {
 
     const receiverSockets = clients.get(to);
     if (!receiverSockets || receiverSockets.size === 0) {
-      // Send FCM notification for call
       await sendFCMNotification(
         to,
         `📞 ${isVideo ? 'مكالمة فيديو' : 'مكالمة صوتية'}`,
@@ -757,10 +801,11 @@ app.post('/call/start', async (req, res) => {
         {
           type: 'call',
           from: from,
-          isVideo: String(isVideo || false)
+          isVideo: String(isVideo || false),
+          callerName: from
         }
       );
-      return res.status(404).json({ error: 'User offline, notification sent' });
+      return res.json({ success: true, message: 'Notification sent' });
     }
 
     const message = JSON.stringify({
@@ -787,10 +832,10 @@ app.post('/call/start', async (req, res) => {
         {
           type: 'call',
           from: from,
-          isVideo: String(isVideo || false)
+          isVideo: String(isVideo || false),
+          callerName: from
         }
       );
-      return res.status(404).json({ error: 'User offline, notification sent' });
     }
 
     res.json({ success: true, message: 'Call initiated' });
@@ -800,7 +845,6 @@ app.post('/call/start', async (req, res) => {
   }
 });
 
-// Answer Call
 app.post('/call/answer', async (req, res) => {
   const { from, to, answer } = req.body;
   const token = req.headers.authorization?.split(' ')[1];
@@ -860,7 +904,6 @@ app.post('/call/answer', async (req, res) => {
   }
 });
 
-// ICE Exchange
 app.post('/call/ice', async (req, res) => {
   const { from, to, candidate } = req.body;
   const token = req.headers.authorization?.split(' ')[1];
@@ -905,7 +948,6 @@ app.post('/call/ice', async (req, res) => {
   }
 });
 
-// End Call
 app.post('/call/end', async (req, res) => {
   const { from, to } = req.body;
   const token = req.headers.authorization?.split(' ')[1];
@@ -956,7 +998,6 @@ app.post('/call/end', async (req, res) => {
   }
 });
 
-// Reject Call
 app.post('/call/reject', async (req, res) => {
   const { from, to } = req.body;
   const token = req.headers.authorization?.split(' ')[1];
@@ -1006,7 +1047,6 @@ app.post('/call/reject', async (req, res) => {
   }
 });
 
-// Call Status
 app.get('/call/status', async (req, res) => {
   const { with: otherUser } = req.query;
   const token = req.headers.authorization?.split(' ')[1];
@@ -1053,7 +1093,6 @@ app.get('/call/status', async (req, res) => {
   }
 });
 
-// Call History
 app.get('/call/history', async (req, res) => {
   const token = req.headers.authorization?.split(' ')[1];
 
@@ -1084,7 +1123,10 @@ app.get('/call/history', async (req, res) => {
   }
 });
 
-// ============ WebSocket Server ============
+// ============================================================
+// ============ WEBSOCKET SERVER ============
+// ============================================================
+
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 const clients = new Map();
@@ -1125,7 +1167,6 @@ wss.on('connection', (ws) => {
           
           broadcastOnlineUsers();
           
-          // Send inbox
           try {
             const client = await pool.connect();
             try {
@@ -1199,7 +1240,7 @@ wss.on('connection', (ws) => {
               {
                 type: 'message',
                 sender: username,
-                messageId: result.rows[0].id
+                messageId: String(result.rows[0].id)
               }
             );
           }
@@ -1411,12 +1452,15 @@ function broadcastUserStatus(username, isOnline) {
   });
 }
 
-// ============ Start Server ============
+// ============================================================
+// ============ START SERVER ============
+// ============================================================
+
 const startServer = async () => {
   console.log('🚀 Starting WorldChat Server v2.7.0...');
   console.log('📡 DATABASE_URL:', DATABASE_URL ? 'Set ✅' : 'Missing ❌');
   console.log('🔐 JWT_SECRET:', JWT_SECRET ? 'Set ✅' : 'Missing ❌');
-  console.log('🔥 Firebase:', admin.apps.length ? 'Initialized ✅' : 'Not initialized ❌');
+  console.log('🔥 Firebase:', firebaseInitialized ? 'Connected ✅' : 'Disabled ❌');
   
   const dbReady = await initDB();
   
@@ -1424,10 +1468,9 @@ const startServer = async () => {
     console.log(`🚀 Server running on port ${port}`);
     console.log(`📊 DB Status: ${dbReady ? 'ready ✅' : 'not ready ❌'}`);
     console.log('✨ Features: chat, media, profile, calls, offline_inbox, background_support');
-    console.log('👥 Multi-device: enabled');
     console.log('📬 Offline Inbox: enabled');
     console.log('📞 WebRTC Signaling: enabled');
-    console.log('🔥 Firebase FCM + Storage: enabled');
+    console.log('🔥 Firebase: ' + (firebaseInitialized ? 'FCM + Storage enabled' : 'disabled'));
   });
 };
 
