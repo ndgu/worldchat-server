@@ -38,15 +38,19 @@ const initDB = async () => {
         display_name TEXT,
         avatar TEXT,
         profile_pic TEXT,
+        last_seen TIMESTAMP DEFAULT NOW(),
+        is_online BOOLEAN DEFAULT FALSE,
         created_at TIMESTAMP DEFAULT NOW()
       );
     `);
 
-    // إضافة الأعمدة المفقودة في users
-    const userColumns = ['display_name', 'avatar', 'profile_pic'];
+    // إضافة الأعمدة المفقودة
+    const userColumns = ['display_name', 'avatar', 'profile_pic', 'last_seen', 'is_online'];
     for (const col of userColumns) {
       try {
-        await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS ${col} TEXT;`);
+        const type = col === 'is_online' ? 'BOOLEAN DEFAULT FALSE' : 
+                     col === 'last_seen' ? 'TIMESTAMP DEFAULT NOW()' : 'TEXT';
+        await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS ${col} ${type};`);
         console.log(`✅ Column ${col} added to users`);
       } catch (e) { /* العمود موجود */ }
     }
@@ -82,7 +86,7 @@ const initDB = async () => {
       } catch (e) { /* العمود موجود */ }
     }
 
-    // جدول calls (لتسجيل المكالمات)
+    // جدول calls
     await pool.query(`
       CREATE TABLE IF NOT EXISTS calls (
         id SERIAL PRIMARY KEY,
@@ -96,7 +100,7 @@ const initDB = async () => {
     `);
     console.log('✅ Calls table ready');
 
-    console.log('✅ Database initialization complete (v2.6.0)');
+    console.log('✅ Database initialization complete (v2.7.0)');
     return true;
   } catch (err) {
     console.error('❌ DB init error:', err.message);
@@ -125,11 +129,72 @@ app.get('/health', async (req, res) => {
   res.json({
     ok: true,
     service: 'worldchat',
-    version: '2.6.0',
+    version: '2.7.0',
     db: dbStatus,
     usersCount: usersCount,
-    features: ['chat', 'media', 'profile', 'calls', 'offline_inbox']
+    features: ['chat', 'media', 'profile', 'calls', 'offline_inbox', 'background_support']
   });
+});
+
+// ============ تحديث حالة المستخدم (Online/Offline) ============
+app.post('/user/status', async (req, res) => {
+  const { username, isOnline } = req.body;
+  const token = req.headers.authorization?.split(' ')[1];
+
+  if (!token) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    if (decoded.username !== username) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query(
+        `UPDATE users SET is_online = $1, last_seen = NOW() WHERE username = $2`,
+        [isOnline, username]
+      );
+      
+      // بث حالة المستخدم للمتصلين
+      broadcastUserStatus(username, isOnline);
+      
+      res.json({ success: true, isOnline: isOnline });
+    } finally {
+      client.release();
+    }
+  } catch (e) {
+    console.error('Status error:', e.message);
+    res.status(500).json({ error: 'Server error: ' + e.message });
+  }
+});
+
+// ============ جلب حالة المستخدمين ============
+app.get('/users/status', async (req, res) => {
+  const token = req.headers.authorization?.split(' ')[1];
+
+  if (!token) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const client = await pool.connect();
+    try {
+      const result = await client.query(
+        `SELECT username, is_online, last_seen FROM users WHERE username != $1`,
+        [decoded.username]
+      );
+      res.json(result.rows);
+    } finally {
+      client.release();
+    }
+  } catch (e) {
+    console.error('Users status error:', e.message);
+    res.status(500).json({ error: 'Server error: ' + e.message });
+  }
 });
 
 // ============ تسجيل حساب جديد ============
@@ -158,8 +223,9 @@ app.post('/register', async (req, res) => {
       
       const hashed = await bcrypt.hash(password, 10);
       await client.query(
-        'INSERT INTO users (username, password, display_name, profile_pic) VALUES ($1, $2, $3, $4)',
-        [username, hashed, displayName || username, profilePic || null]
+        `INSERT INTO users (username, password, display_name, profile_pic, is_online) 
+         VALUES ($1, $2, $3, $4, $5)`,
+        [username, hashed, displayName || username, profilePic || null, true]
       );
       
       const token = jwt.sign({ username }, JWT_SECRET);
@@ -193,6 +259,12 @@ app.post('/login', async (req, res) => {
       if (!valid) {
         return res.status(401).json({ error: 'Invalid credentials' });
       }
+      
+      // تحديث حالة المستخدم
+      await client.query(
+        `UPDATE users SET is_online = TRUE, last_seen = NOW() WHERE username = $1`,
+        [username]
+      );
       
       const token = jwt.sign({ username }, JWT_SECRET);
       res.json({ 
@@ -263,7 +335,8 @@ app.get('/me', async (req, res) => {
     const client = await pool.connect();
     try {
       const result = await client.query(
-        'SELECT username, display_name, profile_pic, created_at FROM users WHERE username = $1',
+        `SELECT username, display_name, profile_pic, is_online, last_seen, created_at 
+         FROM users WHERE username = $1`,
         [decoded.username]
       );
       if (result.rows.length === 0) {
@@ -285,7 +358,8 @@ app.get('/users', async (req, res) => {
     const client = await pool.connect();
     try {
       const result = await client.query(
-        'SELECT username, display_name, profile_pic FROM users ORDER BY username'
+        `SELECT username, display_name, profile_pic, is_online, last_seen 
+         FROM users ORDER BY username`
       );
       res.json(result.rows);
     } finally {
@@ -309,8 +383,10 @@ app.get('/users/search', async (req, res) => {
     const client = await pool.connect();
     try {
       const result = await client.query(
-        `SELECT username, display_name, profile_pic FROM users 
-         WHERE username ILIKE $1 ORDER BY username LIMIT 20`,
+        `SELECT username, display_name, profile_pic, is_online, last_seen 
+         FROM users 
+         WHERE username ILIKE $1 
+         ORDER BY username LIMIT 20`,
         [`%${username}%`]
       );
       res.json(result.rows);
@@ -408,41 +484,13 @@ app.post('/messages/send', async (req, res) => {
     
     const client = await pool.connect();
     try {
-      // التحقق من وجود الأعمدة ديناميكياً
-      const columnCheck = await client.query(`
-        SELECT column_name FROM information_schema.columns 
-        WHERE table_name = 'messages' AND column_name IN ('media_type', 'media_url', 'reply_to')
-      `);
-      const existingColumns = columnCheck.rows.map(row => row.column_name);
+      const result = await client.query(
+        `INSERT INTO messages (sender, receiver, content, media_type, media_url, reply_to) 
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+        [sender, receiver, content || null, mediaType || null, mediaUrl || null, replyTo || null]
+      );
       
-      let insertQuery = 'INSERT INTO messages (sender, receiver, content';
-      let values = [sender, receiver, content || null];
-      let valuePlaceholders = ['$1', '$2', '$3'];
-      let paramIndex = 4;
-      
-      if (existingColumns.includes('media_type') && mediaType) {
-        insertQuery += ', media_type';
-        values.push(mediaType);
-        valuePlaceholders.push(`$${paramIndex++}`);
-      }
-      
-      if (existingColumns.includes('media_url') && mediaUrl) {
-        insertQuery += ', media_url';
-        values.push(mediaUrl);
-        valuePlaceholders.push(`$${paramIndex++}`);
-      }
-      
-      if (existingColumns.includes('reply_to') && replyTo) {
-        insertQuery += ', reply_to';
-        values.push(replyTo);
-        valuePlaceholders.push(`$${paramIndex++}`);
-      }
-      
-      insertQuery += `) VALUES (${valuePlaceholders.join(', ')}) RETURNING *`;
-      
-      const result = await client.query(insertQuery, values);
-      
-      // إرسال عبر WebSocket للمستقبل
+      // إرسال للمستقبل إذا كان متصلاً
       const receiverSockets = clients.get(receiver);
       if (receiverSockets) {
         const messageData = JSON.stringify({
@@ -620,27 +668,18 @@ app.post('/call/start', async (req, res) => {
     // التحقق من وجود المستخدم الآخر
     const client = await pool.connect();
     try {
-      const userCheck = await client.query('SELECT username FROM users WHERE username = $1', [to]);
+      const userCheck = await client.query('SELECT username, is_online FROM users WHERE username = $1', [to]);
       if (userCheck.rows.length === 0) {
         return res.status(404).json({ error: 'User not found' });
       }
+      
+      // حفظ سجل المكالمة
+      await client.query(
+        'INSERT INTO calls (caller, receiver, status) VALUES ($1, $2, $3)',
+        [from, to, 'ringing']
+      );
     } finally {
       client.release();
-    }
-
-    // حفظ سجل المكالمة
-    try {
-      const client = await pool.connect();
-      try {
-        await client.query(
-          'INSERT INTO calls (caller, receiver, status) VALUES ($1, $2, $3)',
-          [from, to, 'ringing']
-        );
-      } finally {
-        client.release();
-      }
-    } catch (e) {
-      console.error('Save call record error:', e);
     }
 
     // إرسال إشارة المكالمة إلى الطرف الآخر عبر WebSocket
@@ -653,7 +692,8 @@ app.post('/call/start', async (req, res) => {
       type: 'call_offer',
       from: from,
       offer: offer,
-      isVideo: isVideo || false
+      isVideo: isVideo || false,
+      callerName: from
     });
 
     let delivered = false;
@@ -695,7 +735,8 @@ app.post('/call/answer', async (req, res) => {
       const client = await pool.connect();
       try {
         await client.query(
-          'UPDATE calls SET status = $1 WHERE caller = $2 AND receiver = $3 AND ended_at IS NULL',
+          `UPDATE calls SET status = $1, started_at = NOW() 
+           WHERE caller = $2 AND receiver = $3 AND ended_at IS NULL`,
           ['connected', to, from]
         );
       } finally {
@@ -990,8 +1031,26 @@ wss.on('connection', (ws) => {
           }
           clients.get(username).add(ws);
           
+          // تحديث حالة المستخدم
+          try {
+            const client = await pool.connect();
+            try {
+              await client.query(
+                `UPDATE users SET is_online = TRUE, last_seen = NOW() WHERE username = $1`,
+                [username]
+              );
+            } finally {
+              client.release();
+            }
+          } catch (e) {
+            console.error('Update online status error:', e);
+          }
+          
           ws.send(JSON.stringify({ type: 'auth_ok' }));
           console.log(`✅ ${username} connected (${clients.get(username).size} devices)`);
+          
+          // بث المستخدمين المتصلين
+          broadcastOnlineUsers();
           
           // إرسال البريد الوارد (Inbox)
           try {
@@ -1026,9 +1085,12 @@ wss.on('connection', (ws) => {
             console.error('Inbox delivery error:', e.message);
           }
           
-          broadcastOnlineUsers();
+          // بث حالة المستخدم
+          broadcastUserStatus(username, true);
+          
         } catch (e) {
           ws.send(JSON.stringify({ type: 'auth_fail' }));
+          console.error('Auth error:', e.message);
         }
         return;
       }
@@ -1041,39 +1103,11 @@ wss.on('connection', (ws) => {
         
         const client = await pool.connect();
         try {
-          // التحقق من وجود الأعمدة ديناميكياً
-          const columnCheck = await client.query(`
-            SELECT column_name FROM information_schema.columns 
-            WHERE table_name = 'messages' AND column_name IN ('media_type', 'media_url', 'reply_to')
-          `);
-          const existingColumns = columnCheck.rows.map(row => row.column_name);
-          
-          let insertQuery = 'INSERT INTO messages (sender, receiver, content';
-          let values = [username, receiver, content || null];
-          let valuePlaceholders = ['$1', '$2', '$3'];
-          let paramIndex = 4;
-          
-          if (existingColumns.includes('media_type') && mediaType) {
-            insertQuery += ', media_type';
-            values.push(mediaType);
-            valuePlaceholders.push(`$${paramIndex++}`);
-          }
-          
-          if (existingColumns.includes('media_url') && mediaUrl) {
-            insertQuery += ', media_url';
-            values.push(mediaUrl);
-            valuePlaceholders.push(`$${paramIndex++}`);
-          }
-          
-          if (existingColumns.includes('reply_to') && replyTo) {
-            insertQuery += ', reply_to';
-            values.push(replyTo);
-            valuePlaceholders.push(`$${paramIndex++}`);
-          }
-          
-          insertQuery += `) VALUES (${valuePlaceholders.join(', ')}) RETURNING *`;
-          
-          const result = await client.query(insertQuery, values);
+          const result = await client.query(
+            `INSERT INTO messages (sender, receiver, content, media_type, media_url, reply_to) 
+             VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+            [username, receiver, content || null, mediaType || null, mediaUrl || null, replyTo || null]
+          );
           
           // إرسال للمستقبل
           const receiverSockets = clients.get(receiver);
@@ -1105,7 +1139,8 @@ wss.on('connection', (ws) => {
             type: 'call_offer',
             from: username,
             offer: offer,
-            isVideo: isVideo || false
+            isVideo: isVideo || false,
+            callerName: username
           });
           receiverSockets.forEach((socket) => {
             if (socket.readyState === WebSocket.OPEN) {
@@ -1204,6 +1239,26 @@ wss.on('connection', (ws) => {
         return;
       }
       
+      // ===== حالة المستخدم =====
+      if (data.type === 'status' && username) {
+        const { isOnline } = data;
+        try {
+          const client = await pool.connect();
+          try {
+            await client.query(
+              `UPDATE users SET is_online = $1, last_seen = NOW() WHERE username = $2`,
+              [isOnline, username]
+            );
+          } finally {
+            client.release();
+          }
+          broadcastUserStatus(username, isOnline);
+        } catch (e) {
+          console.error('Status error:', e);
+        }
+        return;
+      }
+      
     } catch (e) {
       console.error('❌ WS error:', e.message);
       ws.send(JSON.stringify({ type: 'error', message: e.message }));
@@ -1218,6 +1273,25 @@ wss.on('connection', (ws) => {
         if (userSockets.size === 0) {
           clients.delete(username);
           console.log(`❌ ${username} disconnected (no devices left)`);
+          
+          // تحديث حالة المستخدم
+          try {
+            const client = pool.connect();
+            client.then(async (c) => {
+              try {
+                await c.query(
+                  `UPDATE users SET is_online = FALSE, last_seen = NOW() WHERE username = $1`,
+                  [username]
+                );
+              } finally {
+                c.release();
+              }
+            });
+          } catch (e) {
+            console.error('Update offline status error:', e);
+          }
+          
+          broadcastUserStatus(username, false);
         } else {
           console.log(`❌ ${username} device disconnected (${userSockets.size} devices remain)`);
         }
@@ -1227,6 +1301,7 @@ wss.on('connection', (ws) => {
   });
 });
 
+// ============ بث قائمة المستخدمين المتصلين ============
 function broadcastOnlineUsers() {
   const onlineUsers = Array.from(clients.keys());
   const message = JSON.stringify({
@@ -1243,9 +1318,27 @@ function broadcastOnlineUsers() {
   });
 }
 
+// ============ بث حالة المستخدم ============
+function broadcastUserStatus(username, isOnline) {
+  const message = JSON.stringify({
+    type: 'user_status',
+    username: username,
+    isOnline: isOnline,
+    lastSeen: new Date().toISOString()
+  });
+  
+  clients.forEach((sockets) => {
+    sockets.forEach((ws) => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(message);
+      }
+    });
+  });
+}
+
 // ============ تشغيل السيرفر ============
 const startServer = async () => {
-  console.log('🚀 Starting WorldChat Server v2.6.0...');
+  console.log('🚀 Starting WorldChat Server v2.7.0...');
   console.log('📡 DATABASE_URL:', DATABASE_URL ? 'Set ✅' : 'Missing ❌');
   console.log('🔐 JWT_SECRET:', JWT_SECRET ? 'Set ✅' : 'Missing ❌');
   
@@ -1254,10 +1347,12 @@ const startServer = async () => {
   server.listen(port, () => {
     console.log(`🚀 Server running on port ${port}`);
     console.log(`📊 DB Status: ${dbReady ? 'ready ✅' : 'not ready ❌'}`);
-    console.log('✨ Features: chat, media, profile, calls, offline_inbox');
+    console.log('✨ Features: chat, media, profile, calls, offline_inbox, background_support');
     console.log('👥 Multi-device support: enabled');
     console.log('📬 Offline Inbox: enabled');
     console.log('📞 WebRTC Signaling: enabled');
+    console.log('🟢 Online/Offline status: enabled');
+    console.log('📱 Background support: enabled');
   });
 };
 
