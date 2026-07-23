@@ -1,7 +1,7 @@
 {
   "name": "worldchat-server",
-  "version": "2.4.0",
-  "description": "WorldChat full-featured backend server with WebSocket, Media, and WebRTC signaling",
+  "version": "2.5.0",
+  "description": "WorldChat full-featured backend server with WebSocket, Media, WebRTC, and Offline Inbox",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
