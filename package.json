@@ -1,7 +1,7 @@
 {
   "name": "worldchat-server",
-  "version": "1.1.0",
-  "description": "WorldChat backend server with WebSocket",
+  "version": "2.2.0",
+  "description": "WorldChat full-featured backend server with WebSocket, Media, and WebRTC signaling",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
@@ -12,7 +12,9 @@
     "pg": "^8.11.3",
     "jsonwebtoken": "^9.0.2",
     "bcryptjs": "^2.4.3",
-    "ws": "^8.14.2"
+    "ws": "^8.14.2",
+    "multer": "^1.4.5-lts.1",
+    "uuid": "^9.0.0"
   },
   "engines": {
     "node": ">=18.0.0"
