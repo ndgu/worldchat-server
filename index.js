@@ -5,7 +5,43 @@ const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const WebSocket = require('ws');
 const http = require('http');
+const multer = require('multer');
+const { v4: uuidv4 } = require('uuid');
 
+// ============ Firebase Admin SDK ============
+const admin = require('firebase-admin');
+
+// تهيئة Firebase من متغيرات البيئة
+if (!admin.apps.length) {
+  try {
+    // محاولة استخدام متغيرات البيئة
+    const serviceAccount = {
+      type: "service_account",
+      project_id: process.env.FIREBASE_PROJECT_ID,
+      private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID,
+      private_key: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+      client_email: process.env.FIREBASE_CLIENT_EMAIL,
+      client_id: process.env.FIREBASE_CLIENT_ID,
+      auth_uri: "https://accounts.google.com/o/oauth2/auth",
+      token_uri: "https://oauth2.googleapis.com/token",
+      auth_provider_x509_cert_url: "https://www.googleapis.com/oauth2/v1/certs",
+      client_x509_cert_url: process.env.FIREBASE_CLIENT_CERT_URL
+    };
+
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount),
+      storageBucket: process.env.FIREBASE_STORAGE_BUCKET || 'worldchat-cde0b.appspot.com'
+    });
+    console.log('🔥 Firebase Admin initialized successfully');
+  } catch (e) {
+    console.log('⚠️ Firebase Admin init error:', e.message);
+  }
+}
+
+const bucket = admin.storage().bucket();
+const fcm = admin.messaging();
+
+// ============ Express App ============
 const app = express();
 const port = process.env.PORT || 3000;
 
@@ -26,7 +62,7 @@ const pool = new Pool({
 
 const JWT_SECRET = process.env.JWT_SECRET || 'worldchat_super_secret_key_2026_ahmed_12345';
 
-// ============ إنشاء الجداول وتحديثها ============
+// ============ إنشاء الجداول ============
 const initDB = async () => {
   try {
     // جدول users
@@ -38,20 +74,19 @@ const initDB = async () => {
         display_name TEXT,
         avatar TEXT,
         profile_pic TEXT,
-        last_seen TIMESTAMP DEFAULT NOW(),
         is_online BOOLEAN DEFAULT FALSE,
+        last_seen TIMESTAMP DEFAULT NOW(),
         created_at TIMESTAMP DEFAULT NOW()
       );
     `);
 
     // إضافة الأعمدة المفقودة
-    const userColumns = ['display_name', 'avatar', 'profile_pic', 'last_seen', 'is_online'];
+    const userColumns = ['display_name', 'avatar', 'profile_pic', 'is_online', 'last_seen'];
     for (const col of userColumns) {
       try {
         const type = col === 'is_online' ? 'BOOLEAN DEFAULT FALSE' : 
                      col === 'last_seen' ? 'TIMESTAMP DEFAULT NOW()' : 'TEXT';
         await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS ${col} ${type};`);
-        console.log(`✅ Column ${col} added to users`);
       } catch (e) { /* العمود موجود */ }
     }
 
@@ -82,7 +117,6 @@ const initDB = async () => {
     for (const col of msgColumns) {
       try {
         await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS ${col.name} ${col.type};`);
-        console.log(`✅ Column ${col.name} added to messages`);
       } catch (e) { /* العمود موجود */ }
     }
 
@@ -98,13 +132,88 @@ const initDB = async () => {
         duration INTEGER DEFAULT 0
       );
     `);
-    console.log('✅ Calls table ready');
 
-    console.log('✅ Database initialization complete (v2.7.0)');
+    // جدول devices (لـ FCM)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS devices (
+        id SERIAL PRIMARY KEY,
+        username TEXT NOT NULL,
+        fcm_token TEXT UNIQUE NOT NULL,
+        platform TEXT DEFAULT 'android',
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+    `);
+
+    console.log('✅ Database tables ready (v2.7.0)');
     return true;
   } catch (err) {
     console.error('❌ DB init error:', err.message);
     return false;
+  }
+};
+
+// ============ FCM دالة إرسال الإشعارات ============
+const sendFCMNotification = async (toUsername, title, body, data = {}) => {
+  try {
+    const client = await pool.connect();
+    try {
+      const result = await client.query(
+        `SELECT fcm_token FROM devices WHERE username = $1`,
+        [toUsername]
+      );
+      
+      const tokens = result.rows.map(row => row.fcm_token);
+      if (tokens.length === 0) {
+        console.log(`📱 No devices registered for ${toUsername}`);
+        return;
+      }
+
+      const stringData = {};
+      for (const [key, value] of Object.entries(data)) {
+        stringData[key] = String(value);
+      }
+
+      const message = {
+        tokens: tokens,
+        notification: { title, body },
+        data: stringData,
+        android: {
+          priority: 'high',
+          notification: {
+            sound: 'default',
+            clickAction: 'OPEN_ACTIVITY'
+          }
+        }
+      };
+
+      const response = await fcm.sendEachForMulticast(message);
+      console.log(`📨 FCM sent: ${response.successCount} delivered`);
+
+      // تنظيف التوكنات غير الصالحة
+      const staleTokens = [];
+      response.responses.forEach((resp, index) => {
+        if (resp.error && resp.error.message.includes('registration-token-not-registered')) {
+          staleTokens.push(tokens[index]);
+        }
+      });
+
+      if (staleTokens.length > 0) {
+        const client2 = await pool.connect();
+        try {
+          await client2.query(
+            `DELETE FROM devices WHERE fcm_token = ANY($1)`,
+            [staleTokens]
+          );
+          console.log(`🧹 Cleaned ${staleTokens.length} stale FCM tokens`);
+        } finally {
+          client2.release();
+        }
+      }
+    } finally {
+      client.release();
+    }
+  } catch (e) {
+    console.error('FCM error:', e.message);
   }
 };
 
@@ -136,9 +245,59 @@ app.get('/health', async (req, res) => {
   });
 });
 
-// ============ تحديث حالة المستخدم (Online/Offline) ============
-app.post('/user/status', async (req, res) => {
-  const { username, isOnline } = req.body;
+// ============ Upload to Firebase Storage ============
+const upload = multer({ storage: multer.memoryStorage() });
+
+app.post('/upload', upload.single('file'), async (req, res) => {
+  const token = req.headers.authorization?.split(' ')[1];
+  
+  if (!token) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const username = decoded.username;
+
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+
+    const fileName = `uploads/${username}/${Date.now()}-${req.file.originalname}`;
+    const file = bucket.file(fileName);
+
+    const stream = file.createWriteStream({
+      metadata: { contentType: req.file.mimetype }
+    });
+
+    stream.on('error', (err) => {
+      console.error('Upload error:', err);
+      return res.status(500).json({ error: 'Upload failed' });
+    });
+
+    stream.on('finish', async () => {
+      const [url] = await file.getSignedUrl({
+        action: 'read',
+        expires: Date.now() + 7 * 24 * 60 * 60 * 1000
+      });
+      
+      res.json({
+        success: true,
+        fileUrl: url,
+        fileName: fileName
+      });
+    });
+
+    stream.end(req.file.buffer);
+  } catch (e) {
+    console.error('Upload error:', e);
+    res.status(500).json({ error: 'Server error: ' + e.message });
+  }
+});
+
+// ============ Device Registration (FCM) ============
+app.post('/device/register', async (req, res) => {
+  const { username, fcmToken, platform } = req.body;
   const token = req.headers.authorization?.split(' ')[1];
 
   if (!token) {
@@ -151,28 +310,31 @@ app.post('/user/status', async (req, res) => {
       return res.status(403).json({ error: 'Forbidden' });
     }
 
+    if (!fcmToken) {
+      return res.status(400).json({ error: 'FCM token required' });
+    }
+
     const client = await pool.connect();
     try {
       await client.query(
-        `UPDATE users SET is_online = $1, last_seen = NOW() WHERE username = $2`,
-        [isOnline, username]
+        `INSERT INTO devices (username, fcm_token, platform) 
+         VALUES ($1, $2, $3) 
+         ON CONFLICT (fcm_token) DO UPDATE SET username = $1, platform = $3`,
+        [username, fcmToken, platform || 'android']
       );
-      
-      // بث حالة المستخدم للمتصلين
-      broadcastUserStatus(username, isOnline);
-      
-      res.json({ success: true, isOnline: isOnline });
+      res.json({ success: true });
     } finally {
       client.release();
     }
   } catch (e) {
-    console.error('Status error:', e.message);
+    console.error('Device register error:', e);
     res.status(500).json({ error: 'Server error: ' + e.message });
   }
 });
 
-// ============ جلب حالة المستخدمين ============
-app.get('/users/status', async (req, res) => {
+// ============ Device Unregister ============
+app.delete('/device/unregister', async (req, res) => {
+  const { fcmToken } = req.body;
   const token = req.headers.authorization?.split(' ')[1];
 
   if (!token) {
@@ -180,24 +342,20 @@ app.get('/users/status', async (req, res) => {
   }
 
   try {
-    const decoded = jwt.verify(token, JWT_SECRET);
     const client = await pool.connect();
     try {
-      const result = await client.query(
-        `SELECT username, is_online, last_seen FROM users WHERE username != $1`,
-        [decoded.username]
-      );
-      res.json(result.rows);
+      await client.query('DELETE FROM devices WHERE fcm_token = $1', [fcmToken]);
+      res.json({ success: true });
     } finally {
       client.release();
     }
   } catch (e) {
-    console.error('Users status error:', e.message);
+    console.error('Device unregister error:', e);
     res.status(500).json({ error: 'Server error: ' + e.message });
   }
 });
 
-// ============ تسجيل حساب جديد ============
+// ============ Register ============
 app.post('/register', async (req, res) => {
   const { username, password, displayName, profilePic } = req.body;
   
@@ -239,7 +397,7 @@ app.post('/register', async (req, res) => {
   }
 });
 
-// ============ تسجيل الدخول ============
+// ============ Login ============
 app.post('/login', async (req, res) => {
   const { username, password } = req.body;
   
@@ -260,7 +418,6 @@ app.post('/login', async (req, res) => {
         return res.status(401).json({ error: 'Invalid credentials' });
       }
       
-      // تحديث حالة المستخدم
       await client.query(
         `UPDATE users SET is_online = TRUE, last_seen = NOW() WHERE username = $1`,
         [username]
@@ -282,7 +439,7 @@ app.post('/login', async (req, res) => {
   }
 });
 
-// ============ تحديث الملف الشخصي ============
+// ============ Update Profile ============
 app.post('/update-profile', async (req, res) => {
   const { username, displayName, profilePic, password } = req.body;
   const token = req.headers.authorization?.split(' ')[1];
@@ -322,7 +479,7 @@ app.post('/update-profile', async (req, res) => {
   }
 });
 
-// ============ جلب معلومات المستخدم ============
+// ============ Get Me ============
 app.get('/me', async (req, res) => {
   const token = req.headers.authorization?.split(' ')[1];
   
@@ -352,7 +509,7 @@ app.get('/me', async (req, res) => {
   }
 });
 
-// ============ جلب قائمة المستخدمين ============
+// ============ Get Users ============
 app.get('/users', async (req, res) => {
   try {
     const client = await pool.connect();
@@ -371,7 +528,7 @@ app.get('/users', async (req, res) => {
   }
 });
 
-// ============ البحث عن مستخدمين ============
+// ============ Search Users ============
 app.get('/users/search', async (req, res) => {
   const { username } = req.query;
   
@@ -399,7 +556,7 @@ app.get('/users/search', async (req, res) => {
   }
 });
 
-// ============ جلب جميع رسائل المستخدم (Inbox) ============
+// ============ Inbox ============
 app.get('/inbox', async (req, res) => {
   const token = req.headers.authorization?.split(' ')[1];
   
@@ -436,7 +593,7 @@ app.get('/inbox', async (req, res) => {
   }
 });
 
-// ============ جلب رسائل المحادثة ============
+// ============ Get Messages ============
 app.post('/messages', async (req, res) => {
   const { myUsername, otherUsername, limit = 50, offset = 0 } = req.body;
   
@@ -463,7 +620,7 @@ app.post('/messages', async (req, res) => {
   }
 });
 
-// ============ إرسال رسالة (HTTP) ============
+// ============ Send Message (HTTP) ============
 app.post('/messages/send', async (req, res) => {
   const { sender, receiver, content, mediaType, mediaUrl, replyTo } = req.body;
   const token = req.headers.authorization?.split(' ')[1];
@@ -490,7 +647,7 @@ app.post('/messages/send', async (req, res) => {
         [sender, receiver, content || null, mediaType || null, mediaUrl || null, replyTo || null]
       );
       
-      // إرسال للمستقبل إذا كان متصلاً
+      // Send via WebSocket
       const receiverSockets = clients.get(receiver);
       if (receiverSockets) {
         const messageData = JSON.stringify({
@@ -502,6 +659,18 @@ app.post('/messages/send', async (req, res) => {
             socket.send(messageData);
           }
         });
+      } else {
+        // Send FCM notification if user offline
+        await sendFCMNotification(
+          receiver,
+          sender,
+          content || '📷 صورة جديدة',
+          {
+            type: 'message',
+            sender: sender,
+            messageId: result.rows[0].id
+          }
+        );
       }
       
       res.json(result.rows[0]);
@@ -514,107 +683,7 @@ app.post('/messages/send', async (req, res) => {
   }
 });
 
-// ============ إرسال رسالة (بديل) ============
-app.post('/send-message', async (req, res) => {
-  const { sender, receiver, content, mediaType, mediaUrl, replyTo } = req.body;
-  const token = req.headers.authorization?.split(' ')[1];
-  
-  if (!token) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-  
-  try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    if (decoded.username !== sender) {
-      return res.status(403).json({ error: 'Forbidden' });
-    }
-    
-    if (!receiver) {
-      return res.status(400).json({ error: 'Receiver required' });
-    }
-    
-    const client = await pool.connect();
-    try {
-      const result = await client.query(
-        `INSERT INTO messages (sender, receiver, content, media_type, media_url, reply_to) 
-         VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-        [sender, receiver, content || null, mediaType || null, mediaUrl || null, replyTo || null]
-      );
-      
-      const receiverSockets = clients.get(receiver);
-      if (receiverSockets) {
-        const messageData = JSON.stringify({
-          type: 'message',
-          ...result.rows[0]
-        });
-        receiverSockets.forEach((socket) => {
-          if (socket.readyState === WebSocket.OPEN) {
-            socket.send(messageData);
-          }
-        });
-      }
-      
-      res.json(result.rows[0]);
-    } finally {
-      client.release();
-    }
-  } catch (e) {
-    console.error('Send message error:', e.message);
-    res.status(500).json({ error: 'Server error: ' + e.message });
-  }
-});
-
-// ============ إرسال رسالة (بديل آخر) ============
-app.post('/chat/send', async (req, res) => {
-  const { sender, receiver, content, mediaType, mediaUrl, replyTo } = req.body;
-  const token = req.headers.authorization?.split(' ')[1];
-  
-  if (!token) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-  
-  try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    if (decoded.username !== sender) {
-      return res.status(403).json({ error: 'Forbidden' });
-    }
-    
-    if (!receiver) {
-      return res.status(400).json({ error: 'Receiver required' });
-    }
-    
-    const client = await pool.connect();
-    try {
-      const result = await client.query(
-        `INSERT INTO messages (sender, receiver, content, media_type, media_url, reply_to) 
-         VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-        [sender, receiver, content || null, mediaType || null, mediaUrl || null, replyTo || null]
-      );
-      
-      const receiverSockets = clients.get(receiver);
-      if (receiverSockets) {
-        const messageData = JSON.stringify({
-          type: 'message',
-          ...result.rows[0]
-        });
-        receiverSockets.forEach((socket) => {
-          if (socket.readyState === WebSocket.OPEN) {
-            socket.send(messageData);
-          }
-        });
-      }
-      
-      res.json(result.rows[0]);
-    } finally {
-      client.release();
-    }
-  } catch (e) {
-    console.error('Send message error:', e.message);
-    res.status(500).json({ error: 'Server error: ' + e.message });
-  }
-});
-
-// ============ تعليم الرسائل كمقروءة ============
+// ============ Mark Messages as Read ============
 app.post('/messages/read', async (req, res) => {
   const { username, otherUsername } = req.body;
   const token = req.headers.authorization?.split(' ')[1];
@@ -646,11 +715,9 @@ app.post('/messages/read', async (req, res) => {
   }
 });
 
-// ============================================================
-// ============ WebRTC Signaling (المكالمات) ============
-// ============================================================
+// ============ Call Routes ============
 
-// ============ بدء مكالمة ============
+// Start Call
 app.post('/call/start', async (req, res) => {
   const { from, to, offer, isVideo } = req.body;
   const token = req.headers.authorization?.split(' ')[1];
@@ -665,7 +732,6 @@ app.post('/call/start', async (req, res) => {
       return res.status(403).json({ error: 'Forbidden' });
     }
 
-    // التحقق من وجود المستخدم الآخر
     const client = await pool.connect();
     try {
       const userCheck = await client.query('SELECT username, is_online FROM users WHERE username = $1', [to]);
@@ -673,7 +739,6 @@ app.post('/call/start', async (req, res) => {
         return res.status(404).json({ error: 'User not found' });
       }
       
-      // حفظ سجل المكالمة
       await client.query(
         'INSERT INTO calls (caller, receiver, status) VALUES ($1, $2, $3)',
         [from, to, 'ringing']
@@ -682,10 +747,20 @@ app.post('/call/start', async (req, res) => {
       client.release();
     }
 
-    // إرسال إشارة المكالمة إلى الطرف الآخر عبر WebSocket
     const receiverSockets = clients.get(to);
     if (!receiverSockets || receiverSockets.size === 0) {
-      return res.status(404).json({ error: 'User offline' });
+      // Send FCM notification for call
+      await sendFCMNotification(
+        to,
+        `📞 ${isVideo ? 'مكالمة فيديو' : 'مكالمة صوتية'}`,
+        `${from} يتصل بك...`,
+        {
+          type: 'call',
+          from: from,
+          isVideo: String(isVideo || false)
+        }
+      );
+      return res.status(404).json({ error: 'User offline, notification sent' });
     }
 
     const message = JSON.stringify({
@@ -705,7 +780,17 @@ app.post('/call/start', async (req, res) => {
     });
 
     if (!delivered) {
-      return res.status(404).json({ error: 'User offline' });
+      await sendFCMNotification(
+        to,
+        `📞 ${isVideo ? 'مكالمة فيديو' : 'مكالمة صوتية'}`,
+        `${from} يتصل بك...`,
+        {
+          type: 'call',
+          from: from,
+          isVideo: String(isVideo || false)
+        }
+      );
+      return res.status(404).json({ error: 'User offline, notification sent' });
     }
 
     res.json({ success: true, message: 'Call initiated' });
@@ -715,7 +800,7 @@ app.post('/call/start', async (req, res) => {
   }
 });
 
-// ============ الرد على مكالمة ============
+// Answer Call
 app.post('/call/answer', async (req, res) => {
   const { from, to, answer } = req.body;
   const token = req.headers.authorization?.split(' ')[1];
@@ -730,7 +815,6 @@ app.post('/call/answer', async (req, res) => {
       return res.status(403).json({ error: 'Forbidden' });
     }
 
-    // تحديث سجل المكالمة
     try {
       const client = await pool.connect();
       try {
@@ -746,7 +830,6 @@ app.post('/call/answer', async (req, res) => {
       console.error('Update call record error:', e);
     }
 
-    // إرسال الرد إلى الطرف الآخر
     const receiverSockets = clients.get(to);
     if (!receiverSockets || receiverSockets.size === 0) {
       return res.status(404).json({ error: 'User offline' });
@@ -777,7 +860,7 @@ app.post('/call/answer', async (req, res) => {
   }
 });
 
-// ============ تبادل ICE Candidates ============
+// ICE Exchange
 app.post('/call/ice', async (req, res) => {
   const { from, to, candidate } = req.body;
   const token = req.headers.authorization?.split(' ')[1];
@@ -822,7 +905,7 @@ app.post('/call/ice', async (req, res) => {
   }
 });
 
-// ============ إنهاء مكالمة ============
+// End Call
 app.post('/call/end', async (req, res) => {
   const { from, to } = req.body;
   const token = req.headers.authorization?.split(' ')[1];
@@ -837,7 +920,6 @@ app.post('/call/end', async (req, res) => {
       return res.status(403).json({ error: 'Forbidden' });
     }
 
-    // تحديث سجل المكالمة
     try {
       const client = await pool.connect();
       try {
@@ -854,7 +936,6 @@ app.post('/call/end', async (req, res) => {
       console.error('Update call record error:', e);
     }
 
-    // إرسال إشارة إنهاء المكالمة
     const receiverSockets = clients.get(to);
     if (receiverSockets && receiverSockets.size > 0) {
       const message = JSON.stringify({
@@ -875,7 +956,7 @@ app.post('/call/end', async (req, res) => {
   }
 });
 
-// ============ رفض مكالمة ============
+// Reject Call
 app.post('/call/reject', async (req, res) => {
   const { from, to } = req.body;
   const token = req.headers.authorization?.split(' ')[1];
@@ -890,7 +971,6 @@ app.post('/call/reject', async (req, res) => {
       return res.status(403).json({ error: 'Forbidden' });
     }
 
-    // تحديث سجل المكالمة
     try {
       const client = await pool.connect();
       try {
@@ -906,7 +986,6 @@ app.post('/call/reject', async (req, res) => {
       console.error('Update call record error:', e);
     }
 
-    // إرسال إشارة رفض المكالمة
     const receiverSockets = clients.get(to);
     if (receiverSockets && receiverSockets.size > 0) {
       const message = JSON.stringify({
@@ -927,7 +1006,7 @@ app.post('/call/reject', async (req, res) => {
   }
 });
 
-// ============ التحقق من حالة المكالمة ============
+// Call Status
 app.get('/call/status', async (req, res) => {
   const { with: otherUser } = req.query;
   const token = req.headers.authorization?.split(' ')[1];
@@ -974,7 +1053,7 @@ app.get('/call/status', async (req, res) => {
   }
 });
 
-// ============ جلب سجل المكالمات ============
+// Call History
 app.get('/call/history', async (req, res) => {
   const token = req.headers.authorization?.split(' ')[1];
 
@@ -1005,10 +1084,7 @@ app.get('/call/history', async (req, res) => {
   }
 });
 
-// ============================================================
 // ============ WebSocket Server ============
-// ============================================================
-
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 const clients = new Map();
@@ -1020,7 +1096,6 @@ wss.on('connection', (ws) => {
     try {
       const data = JSON.parse(message);
       
-      // ===== مصادقة =====
       if (data.type === 'auth') {
         try {
           const decoded = jwt.verify(data.token, JWT_SECRET);
@@ -1031,7 +1106,6 @@ wss.on('connection', (ws) => {
           }
           clients.get(username).add(ws);
           
-          // تحديث حالة المستخدم
           try {
             const client = await pool.connect();
             try {
@@ -1049,10 +1123,9 @@ wss.on('connection', (ws) => {
           ws.send(JSON.stringify({ type: 'auth_ok' }));
           console.log(`✅ ${username} connected (${clients.get(username).size} devices)`);
           
-          // بث المستخدمين المتصلين
           broadcastOnlineUsers();
           
-          // إرسال البريد الوارد (Inbox)
+          // Send inbox
           try {
             const client = await pool.connect();
             try {
@@ -1085,7 +1158,6 @@ wss.on('connection', (ws) => {
             console.error('Inbox delivery error:', e.message);
           }
           
-          // بث حالة المستخدم
           broadcastUserStatus(username, true);
           
         } catch (e) {
@@ -1095,7 +1167,6 @@ wss.on('connection', (ws) => {
         return;
       }
       
-      // ===== رسالة عبر WebSocket =====
       if (data.type === 'message' && username) {
         const { receiver, content, mediaType, mediaUrl, replyTo } = data;
         
@@ -1109,7 +1180,6 @@ wss.on('connection', (ws) => {
             [username, receiver, content || null, mediaType || null, mediaUrl || null, replyTo || null]
           );
           
-          // إرسال للمستقبل
           const receiverSockets = clients.get(receiver);
           if (receiverSockets) {
             const messageData = JSON.stringify({
@@ -1121,6 +1191,17 @@ wss.on('connection', (ws) => {
                 socket.send(messageData);
               }
             });
+          } else {
+            await sendFCMNotification(
+              receiver,
+              username,
+              content || '📷 صورة جديدة',
+              {
+                type: 'message',
+                sender: username,
+                messageId: result.rows[0].id
+              }
+            );
           }
           
           ws.send(JSON.stringify({ type: 'sent', messageId: result.rows[0].id }));
@@ -1130,7 +1211,6 @@ wss.on('connection', (ws) => {
         return;
       }
       
-      // ===== WebRTC Signaling عبر WebSocket =====
       if (data.type === 'call_offer' && username) {
         const { to, offer, isVideo } = data;
         const receiverSockets = clients.get(to);
@@ -1221,7 +1301,6 @@ wss.on('connection', (ws) => {
         return;
       }
       
-      // ===== مؤشر الكتابة =====
       if (data.type === 'typing' && username) {
         const { to } = data;
         const receiverSockets = clients.get(to);
@@ -1239,7 +1318,6 @@ wss.on('connection', (ws) => {
         return;
       }
       
-      // ===== حالة المستخدم =====
       if (data.type === 'status' && username) {
         const { isOnline } = data;
         try {
@@ -1274,7 +1352,6 @@ wss.on('connection', (ws) => {
           clients.delete(username);
           console.log(`❌ ${username} disconnected (no devices left)`);
           
-          // تحديث حالة المستخدم
           try {
             const client = pool.connect();
             client.then(async (c) => {
@@ -1301,7 +1378,6 @@ wss.on('connection', (ws) => {
   });
 });
 
-// ============ بث قائمة المستخدمين المتصلين ============
 function broadcastOnlineUsers() {
   const onlineUsers = Array.from(clients.keys());
   const message = JSON.stringify({
@@ -1318,7 +1394,6 @@ function broadcastOnlineUsers() {
   });
 }
 
-// ============ بث حالة المستخدم ============
 function broadcastUserStatus(username, isOnline) {
   const message = JSON.stringify({
     type: 'user_status',
@@ -1336,11 +1411,12 @@ function broadcastUserStatus(username, isOnline) {
   });
 }
 
-// ============ تشغيل السيرفر ============
+// ============ Start Server ============
 const startServer = async () => {
   console.log('🚀 Starting WorldChat Server v2.7.0...');
   console.log('📡 DATABASE_URL:', DATABASE_URL ? 'Set ✅' : 'Missing ❌');
   console.log('🔐 JWT_SECRET:', JWT_SECRET ? 'Set ✅' : 'Missing ❌');
+  console.log('🔥 Firebase:', admin.apps.length ? 'Initialized ✅' : 'Not initialized ❌');
   
   const dbReady = await initDB();
   
@@ -1348,11 +1424,10 @@ const startServer = async () => {
     console.log(`🚀 Server running on port ${port}`);
     console.log(`📊 DB Status: ${dbReady ? 'ready ✅' : 'not ready ❌'}`);
     console.log('✨ Features: chat, media, profile, calls, offline_inbox, background_support');
-    console.log('👥 Multi-device support: enabled');
+    console.log('👥 Multi-device: enabled');
     console.log('📬 Offline Inbox: enabled');
     console.log('📞 WebRTC Signaling: enabled');
-    console.log('🟢 Online/Offline status: enabled');
-    console.log('📱 Background support: enabled');
+    console.log('🔥 Firebase FCM + Storage: enabled');
   });
 };
 
