@@ -1,6 +1,6 @@
 {
   "name": "worldchat-server",
-  "version": "2.5.0",
+  "version": "2.5.1",
   "description": "WorldChat full-featured backend server with WebSocket, Media, WebRTC, and Offline Inbox",
   "main": "index.js",
   "scripts": {
