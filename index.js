@@ -5,29 +5,29 @@ const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const WebSocket = require('ws');
 const http = require('http');
+const multer = require('multer');
+const { v4: uuidv4 } = require('uuid');
+const path = require('path');
+const fs = require('fs');
 
 const app = express();
 const port = process.env.PORT || 3000;
 
 // Middleware
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
-// 🔥 جبر DATABASE_URL من متغيرات Railway
+// Database
 const DATABASE_URL = process.env.DATABASE_URL;
-
-// Database Connection - مع جبر قوي
 const pool = new Pool({
   connectionString: DATABASE_URL,
-  ssl: {
-    rejectUnauthorized: false
-  },
+  ssl: { rejectUnauthorized: false },
   connectionTimeoutMillis: 10000,
   idleTimeoutMillis: 30000,
   max: 20
 });
 
-// JWT Secret
 const JWT_SECRET = process.env.JWT_SECRET || 'worldchat_super_secret_key_2026_ahmed_12345';
 
 // Create tables
@@ -39,6 +39,7 @@ const initDB = async () => {
         username TEXT UNIQUE NOT NULL,
         password TEXT NOT NULL,
         display_name TEXT,
+        profile_pic TEXT,
         created_at TIMESTAMP DEFAULT NOW()
       );
     `);
@@ -47,11 +48,24 @@ const initDB = async () => {
         id SERIAL PRIMARY KEY,
         sender TEXT NOT NULL,
         receiver TEXT NOT NULL,
-        content TEXT NOT NULL,
+        content TEXT,
+        media_type TEXT,
+        media_url TEXT,
+        reply_to INTEGER,
         timestamp TIMESTAMP DEFAULT NOW()
       );
     `);
-    console.log('✅ Database tables ready');
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS calls (
+        id SERIAL PRIMARY KEY,
+        caller TEXT NOT NULL,
+        receiver TEXT NOT NULL,
+        status TEXT,
+        started_at TIMESTAMP DEFAULT NOW(),
+        ended_at TIMESTAMP
+      );
+    `);
+    console.log('✅ Database tables ready (v2.2)');
     return true;
   } catch (err) {
     console.error('❌ DB init error:', err.message);
@@ -59,11 +73,10 @@ const initDB = async () => {
   }
 };
 
-// Health check with DB status
+// Health check
 app.get('/health', async (req, res) => {
   let dbStatus = 'unknown';
   let usersCount = 0;
-  let dbUrlStatus = DATABASE_URL ? 'set' : 'missing';
   
   try {
     const client = await pool.connect();
@@ -75,24 +88,22 @@ app.get('/health', async (req, res) => {
       client.release();
     }
   } catch (e) {
-    console.error('Health DB error:', e.message);
     dbStatus = 'down';
   }
   
   res.json({
     ok: true,
     service: 'worldchat',
-    version: '1.1.0',
+    version: '2.2.0',
     db: dbStatus,
     usersCount: usersCount,
-    database_url: dbUrlStatus,
-    db_url_length: DATABASE_URL ? DATABASE_URL.length : 0
+    features: ['chat', 'media', 'profile', 'calls']
   });
 });
 
 // Register
 app.post('/register', async (req, res) => {
-  const { username, password, displayName } = req.body;
+  const { username, password, displayName, profilePic } = req.body;
   
   if (!username || !password) {
     return res.status(400).json({ error: 'Username and password required' });
@@ -116,8 +127,8 @@ app.post('/register', async (req, res) => {
       
       const hashed = await bcrypt.hash(password, 10);
       await client.query(
-        'INSERT INTO users (username, password, display_name) VALUES ($1, $2, $3)',
-        [username, hashed, displayName || username]
+        'INSERT INTO users (username, password, display_name, profile_pic) VALUES ($1, $2, $3, $4)',
+        [username, hashed, displayName || username, profilePic || null]
       );
       
       const token = jwt.sign({ username }, JWT_SECRET);
@@ -156,13 +167,54 @@ app.post('/login', async (req, res) => {
       res.json({ 
         token, 
         username, 
-        displayName: result.rows[0].display_name || username 
+        displayName: result.rows[0].display_name || username,
+        profilePic: result.rows[0].profile_pic || null
       });
     } finally {
       client.release();
     }
   } catch (e) {
     console.error('Login error:', e.message);
+    res.status(500).json({ error: 'Server error: ' + e.message });
+  }
+});
+
+// Update profile
+app.post('/update-profile', async (req, res) => {
+  const { username, displayName, profilePic, password } = req.body;
+  const token = req.headers.authorization?.split(' ')[1];
+  
+  if (!token) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    if (decoded.username !== username) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    
+    const client = await pool.connect();
+    try {
+      let query = 'UPDATE users SET display_name = $1, profile_pic = $2';
+      let params = [displayName || username, profilePic || null];
+      
+      if (password && password.length >= 4) {
+        const hashed = await bcrypt.hash(password, 10);
+        query += ', password = $3';
+        params.push(hashed);
+      }
+      
+      query += ' WHERE username = $4';
+      params.push(username);
+      
+      await client.query(query, params);
+      res.json({ success: true });
+    } finally {
+      client.release();
+    }
+  } catch (e) {
+    console.error('Update profile error:', e.message);
     res.status(500).json({ error: 'Server error: ' + e.message });
   }
 });
@@ -199,7 +251,7 @@ app.get('/users', async (req, res) => {
   try {
     const client = await pool.connect();
     try {
-      const result = await client.query('SELECT username, display_name FROM users ORDER BY username');
+      const result = await client.query('SELECT username, display_name, profile_pic FROM users ORDER BY username');
       res.json(result.rows);
     } finally {
       client.release();
@@ -207,6 +259,37 @@ app.get('/users', async (req, res) => {
   } catch (e) {
     console.error('Users error:', e.message);
     res.status(500).json({ error: 'Server error: ' + e.message });
+  }
+});
+
+// WebRTC Signaling
+app.post('/webrtc', async (req, res) => {
+  const { type, from, to, data } = req.body;
+  
+  if (!type || !from || !to) {
+    return res.status(400).json({ error: 'Missing fields' });
+  }
+  
+  try {
+    // Save call record
+    if (type === 'call-start') {
+      await pool.query(
+        'INSERT INTO calls (caller, receiver, status) VALUES ($1, $2, $3)',
+        [from, to, 'ringing']
+      );
+    }
+    
+    if (type === 'call-end') {
+      await pool.query(
+        'UPDATE calls SET status = $1, ended_at = NOW() WHERE caller = $2 AND receiver = $3 AND ended_at IS NULL',
+        ['ended', from, to]
+      );
+    }
+    
+    res.json({ success: true });
+  } catch (e) {
+    console.error('WebRTC error:', e.message);
+    res.status(500).json({ error: 'Server error' });
   }
 });
 
@@ -232,46 +315,55 @@ wss.on('connection', (ws) => {
           console.log(`✅ ${username} connected`);
         } catch (e) {
           ws.send(JSON.stringify({ type: 'auth_fail' }));
-          console.error('Auth error:', e.message);
         }
       }
       
       if (data.type === 'message' && username) {
-        const { receiver, content } = data;
+        const { receiver, content, mediaType, mediaUrl, replyTo } = data;
         
-        if (!receiver || !content) {
-          return;
-        }
+        if (!receiver) return;
         
+        const client = await pool.connect();
         try {
-          const client = await pool.connect();
-          try {
-            await client.query(
-              'INSERT INTO messages (sender, receiver, content) VALUES ($1, $2, $3)',
-              [username, receiver, content]
-            );
-          } finally {
-            client.release();
-          }
-        } catch (e) {
-          console.error('Save message error:', e.message);
+          await client.query(
+            `INSERT INTO messages (sender, receiver, content, media_type, media_url, reply_to) 
+             VALUES ($1, $2, $3, $4, $5, $6)`,
+            [username, receiver, content || null, mediaType || null, mediaUrl || null, replyTo || null]
+          );
+        } finally {
+          client.release();
         }
         
+        // Send to receiver if online
         const receiverWs = clients.get(receiver);
         if (receiverWs && receiverWs.readyState === WebSocket.OPEN) {
           receiverWs.send(JSON.stringify({
             type: 'message',
             sender: username,
-            content: content,
+            content: content || null,
+            mediaType: mediaType || null,
+            mediaUrl: mediaUrl || null,
+            replyTo: replyTo || null,
             timestamp: new Date().toISOString()
           }));
         }
         
-        ws.send(JSON.stringify({ 
-          type: 'sent',
-          timestamp: new Date().toISOString()
-        }));
+        ws.send(JSON.stringify({ type: 'sent' }));
       }
+      
+      // WebRTC Signaling
+      if (data.type === 'webrtc' && username) {
+        const { to, signal } = data;
+        const targetWs = clients.get(to);
+        if (targetWs && targetWs.readyState === WebSocket.OPEN) {
+          targetWs.send(JSON.stringify({
+            type: 'webrtc',
+            from: username,
+            signal: signal
+          }));
+        }
+      }
+      
     } catch (e) {
       console.error('❌ WS error:', e.message);
     }
@@ -287,18 +379,16 @@ wss.on('connection', (ws) => {
 
 // Start server
 const startServer = async () => {
-  console.log('🚀 Starting server...');
-  console.log('📡 DATABASE_URL:', DATABASE_URL ? 'Set ✅ (length: ' + DATABASE_URL.length + ')' : 'Missing ❌');
+  console.log('🚀 Starting WorldChat Server v2.2...');
+  console.log('📡 DATABASE_URL:', DATABASE_URL ? 'Set ✅' : 'Missing ❌');
   console.log('🔐 JWT_SECRET:', JWT_SECRET ? 'Set ✅' : 'Missing ❌');
   
   const dbReady = await initDB();
-  if (!dbReady) {
-    console.log('⚠️ Database not ready, but server will start');
-  }
   
   server.listen(port, () => {
     console.log(`🚀 Server running on port ${port}`);
     console.log(`📊 DB Status: ${dbReady ? 'ready ✅' : 'not ready ❌'}`);
+    console.log('✨ Features: chat, media, profile, calls');
   });
 };
 
