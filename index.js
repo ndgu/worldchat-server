@@ -5,10 +5,6 @@ const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const WebSocket = require('ws');
 const http = require('http');
-const multer = require('multer');
-const { v4: uuidv4 } = require('uuid');
-const path = require('path');
-const fs = require('fs');
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -30,19 +26,39 @@ const pool = new Pool({
 
 const JWT_SECRET = process.env.JWT_SECRET || 'worldchat_super_secret_key_2026_ahmed_12345';
 
-// ============ إنشاء الجداول ============
+// ============ إنشاء الجداول وتحديثها ============
 const initDB = async () => {
   try {
+    // إنشاء جدول users
     await pool.query(`
       CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
         username TEXT UNIQUE NOT NULL,
         password TEXT NOT NULL,
         display_name TEXT,
+        avatar TEXT,
         profile_pic TEXT,
         created_at TIMESTAMP DEFAULT NOW()
       );
     `);
+
+    // إضافة الأعمدة المفقودة (للتوافق مع الإصدارات السابقة)
+    try {
+      await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name TEXT;`);
+      console.log('✅ Column display_name added');
+    } catch (e) { /* العمود موجود */ }
+
+    try {
+      await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar TEXT;`);
+      console.log('✅ Column avatar added');
+    } catch (e) { /* العمود موجود */ }
+
+    try {
+      await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_pic TEXT;`);
+      console.log('✅ Column profile_pic added');
+    } catch (e) { /* العمود موجود */ }
+
+    // جدول messages
     await pool.query(`
       CREATE TABLE IF NOT EXISTS messages (
         id SERIAL PRIMARY KEY,
@@ -57,6 +73,8 @@ const initDB = async () => {
         timestamp TIMESTAMP DEFAULT NOW()
       );
     `);
+
+    // جدول calls
     await pool.query(`
       CREATE TABLE IF NOT EXISTS calls (
         id SERIAL PRIMARY KEY,
@@ -67,7 +85,8 @@ const initDB = async () => {
         ended_at TIMESTAMP
       );
     `);
-    console.log('✅ Database tables ready (v2.2)');
+
+    console.log('✅ Database tables ready (v2.3.0)');
     return true;
   } catch (err) {
     console.error('❌ DB init error:', err.message);
@@ -96,7 +115,7 @@ app.get('/health', async (req, res) => {
   res.json({
     ok: true,
     service: 'worldchat',
-    version: '2.2.0',
+    version: '2.3.0',
     db: dbStatus,
     usersCount: usersCount,
     features: ['chat', 'media', 'profile', 'calls']
@@ -128,6 +147,7 @@ app.post('/register', async (req, res) => {
       }
       
       const hashed = await bcrypt.hash(password, 10);
+      // نحفظ البيانات الأساسية أولاً
       await client.query(
         'INSERT INTO users (username, password, display_name, profile_pic) VALUES ($1, $2, $3, $4)',
         [username, hashed, displayName || username, profilePic || null]
@@ -170,7 +190,7 @@ app.post('/login', async (req, res) => {
         token, 
         username, 
         displayName: result.rows[0].display_name || username,
-        profilePic: result.rows[0].profile_pic || null
+        profilePic: result.rows[0].profile_pic || result.rows[0].avatar || null
       });
     } finally {
       client.release();
@@ -311,7 +331,6 @@ app.post('/messages', async (req, res) => {
          ORDER BY timestamp DESC LIMIT $3 OFFSET $4`,
         [myUsername, otherUsername, limit, offset]
       );
-      // ترتيب تصاعدي للعرض
       res.json(result.rows.reverse());
     } finally {
       client.release();
@@ -349,7 +368,6 @@ app.post('/messages/send', async (req, res) => {
         [sender, receiver, content || null, mediaType || null, mediaUrl || null, replyTo || null]
       );
       
-      // إرسال عبر WebSocket للمستقبل إذا كان متصلاً
       const receiverWs = clients.get(receiver);
       if (receiverWs && receiverWs.readyState === WebSocket.OPEN) {
         receiverWs.send(JSON.stringify({
@@ -419,7 +437,6 @@ app.post('/webrtc', async (req, res) => {
       return res.status(400).json({ error: 'Missing fields' });
     }
     
-    // حفظ سجل المكالمة
     if (type === 'call-start') {
       await pool.query(
         'INSERT INTO calls (caller, receiver, status) VALUES ($1, $2, $3)',
@@ -435,7 +452,6 @@ app.post('/webrtc', async (req, res) => {
       );
     }
     
-    // إعادة توجيه إشارة WebRTC عبر WebSocket
     const targetWs = clients.get(to);
     if (targetWs && targetWs.readyState === WebSocket.OPEN) {
       targetWs.send(JSON.stringify({
@@ -464,7 +480,6 @@ wss.on('connection', (ws) => {
     try {
       const data = JSON.parse(message);
       
-      // مصادقة
       if (data.type === 'auth') {
         try {
           const decoded = jwt.verify(data.token, JWT_SECRET);
@@ -472,16 +487,12 @@ wss.on('connection', (ws) => {
           clients.set(username, ws);
           ws.send(JSON.stringify({ type: 'auth_ok' }));
           console.log(`✅ ${username} connected`);
-          
-          // إرسال قائمة المستخدمين المتصلين
-          const onlineUsers = Array.from(clients.keys());
           broadcastOnlineUsers();
         } catch (e) {
           ws.send(JSON.stringify({ type: 'auth_fail' }));
         }
       }
       
-      // رسالة نصية
       if (data.type === 'message' && username) {
         const { receiver, content, mediaType, mediaUrl, replyTo } = data;
         
@@ -495,7 +506,6 @@ wss.on('connection', (ws) => {
             [username, receiver, content || null, mediaType || null, mediaUrl || null, replyTo || null]
           );
           
-          // إرسال للمستقبل إذا كان متصلاً
           const receiverWs = clients.get(receiver);
           if (receiverWs && receiverWs.readyState === WebSocket.OPEN) {
             receiverWs.send(JSON.stringify({
@@ -510,7 +520,6 @@ wss.on('connection', (ws) => {
         }
       }
       
-      // WebRTC Signaling
       if (data.type === 'webrtc' && username) {
         const { to, signal } = data;
         const targetWs = clients.get(to);
@@ -523,7 +532,6 @@ wss.on('connection', (ws) => {
         }
       }
       
-      // مؤشر الكتابة
       if (data.type === 'typing' && username) {
         const { to } = data;
         const targetWs = clients.get(to);
@@ -549,7 +557,6 @@ wss.on('connection', (ws) => {
   });
 });
 
-// بث قائمة المستخدمين المتصلين
 function broadcastOnlineUsers() {
   const onlineUsers = Array.from(clients.keys());
   const message = JSON.stringify({
@@ -566,7 +573,7 @@ function broadcastOnlineUsers() {
 
 // ============ تشغيل السيرفر ============
 const startServer = async () => {
-  console.log('🚀 Starting WorldChat Server v2.2...');
+  console.log('🚀 Starting WorldChat Server v2.3.0...');
   console.log('📡 DATABASE_URL:', DATABASE_URL ? 'Set ✅' : 'Missing ❌');
   console.log('🔐 JWT_SECRET:', JWT_SECRET ? 'Set ✅' : 'Missing ❌');
   
