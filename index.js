@@ -26,9 +26,10 @@ const pool = new Pool({
 
 const JWT_SECRET = process.env.JWT_SECRET || 'worldchat_super_secret_key_2026_ahmed_12345';
 
-// ============ إنشاء الجداول وتحديثها ============
+// ============ إنشاء الجداول وتحديثها (آلي) ============
 const initDB = async () => {
   try {
+    // 1. جدول users
     await pool.query(`
       CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
@@ -40,18 +41,17 @@ const initDB = async () => {
         created_at TIMESTAMP DEFAULT NOW()
       );
     `);
+    console.log('✅ Users table ready');
 
-    // إضافة الأعمدة المفقودة
-    try {
-      await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name TEXT;`);
-    } catch (e) {}
-    try {
-      await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar TEXT;`);
-    } catch (e) {}
-    try {
-      await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_pic TEXT;`);
-    } catch (e) {}
+    // 2. إضافة أعمدة users المفقودة (إن وجدت)
+    const userColumns = ['display_name', 'avatar', 'profile_pic'];
+    for (const col of userColumns) {
+      try {
+        await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS ${col} TEXT;`);
+      } catch (e) { /* العمود موجود بالفعل */ }
+    }
 
+    // 3. جدول messages
     await pool.query(`
       CREATE TABLE IF NOT EXISTS messages (
         id SERIAL PRIMARY KEY,
@@ -66,7 +66,24 @@ const initDB = async () => {
         timestamp TIMESTAMP DEFAULT NOW()
       );
     `);
+    console.log('✅ Messages table ready');
 
+    // 4. إضافة أعمدة messages المفقودة (الأهم!)
+    const msgColumns = [
+      { name: 'media_type', type: 'TEXT' },
+      { name: 'media_url', type: 'TEXT' },
+      { name: 'reply_to', type: 'INTEGER' },
+      { name: 'delivered', type: 'BOOLEAN DEFAULT FALSE' },
+      { name: 'read', type: 'BOOLEAN DEFAULT FALSE' }
+    ];
+    for (const col of msgColumns) {
+      try {
+        await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS ${col.name} ${col.type};`);
+        console.log(`✅ Column ${col.name} added to messages`);
+      } catch (e) { /* العمود موجود */ }
+    }
+
+    // 5. جدول calls
     await pool.query(`
       CREATE TABLE IF NOT EXISTS calls (
         id SERIAL PRIMARY KEY,
@@ -77,8 +94,9 @@ const initDB = async () => {
         ended_at TIMESTAMP
       );
     `);
+    console.log('✅ Calls table ready');
 
-    console.log('✅ Database tables ready (v2.5.0)');
+    console.log('✅ Database initialization complete (v2.5.1)');
     return true;
   } catch (err) {
     console.error('❌ DB init error:', err.message);
@@ -107,7 +125,7 @@ app.get('/health', async (req, res) => {
   res.json({
     ok: true,
     service: 'worldchat',
-    version: '2.5.0',
+    version: '2.5.1',
     db: dbStatus,
     usersCount: usersCount,
     features: ['chat', 'media', 'profile', 'calls', 'offline_inbox']
@@ -319,7 +337,6 @@ app.get('/inbox', async (req, res) => {
     
     const client = await pool.connect();
     try {
-      // جلب جميع الرسائل التي تخص هذا المستخدم (مرسلة أو مستقبلة)
       const result = await client.query(
         `SELECT * FROM messages WHERE 
          sender = $1 OR receiver = $1
@@ -327,7 +344,6 @@ app.get('/inbox', async (req, res) => {
         [username]
       );
       
-      // تحديث حالة delivered للرسائل المستقبلة
       await client.query(
         `UPDATE messages SET delivered = TRUE 
          WHERE receiver = $1 AND delivered = FALSE`,
@@ -392,11 +408,40 @@ app.post('/messages/send', async (req, res) => {
     
     const client = await pool.connect();
     try {
-      const result = await client.query(
-        `INSERT INTO messages (sender, receiver, content, media_type, media_url, reply_to) 
-         VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-        [sender, receiver, content || null, mediaType || null, mediaUrl || null, replyTo || null]
-      );
+      // التحقق من وجود الأعمدة ديناميكياً
+      const columnCheck = await client.query(`
+        SELECT column_name FROM information_schema.columns 
+        WHERE table_name = 'messages' AND column_name IN ('media_type', 'media_url', 'reply_to')
+      `);
+      const existingColumns = columnCheck.rows.map(row => row.column_name);
+      
+      // بناء الاستعلام بناءً على الأعمدة الموجودة
+      let insertQuery = 'INSERT INTO messages (sender, receiver, content';
+      let values = [sender, receiver, content || null];
+      let valuePlaceholders = ['$1', '$2', '$3'];
+      let paramIndex = 4;
+      
+      if (existingColumns.includes('media_type') && mediaType) {
+        insertQuery += ', media_type';
+        values.push(mediaType);
+        valuePlaceholders.push(`$${paramIndex++}`);
+      }
+      
+      if (existingColumns.includes('media_url') && mediaUrl) {
+        insertQuery += ', media_url';
+        values.push(mediaUrl);
+        valuePlaceholders.push(`$${paramIndex++}`);
+      }
+      
+      if (existingColumns.includes('reply_to') && replyTo) {
+        insertQuery += ', reply_to';
+        values.push(replyTo);
+        valuePlaceholders.push(`$${paramIndex++}`);
+      }
+      
+      insertQuery += `) VALUES (${valuePlaceholders.join(', ')}) RETURNING *`;
+      
+      const result = await client.query(insertQuery, values);
       
       // إرسال عبر WebSocket للمستقبل إذا كان متصلاً
       const receiverSockets = clients.get(receiver);
@@ -424,7 +469,7 @@ app.post('/messages/send', async (req, res) => {
 
 // ============ إرسال رسالة (بديل) ============
 app.post('/send-message', async (req, res) => {
-  // نفس المنطق أعلاه
+  // نفس منطق /messages/send
   const { sender, receiver, content, mediaType, mediaUrl, replyTo } = req.body;
   const token = req.headers.authorization?.split(' ')[1];
   
@@ -444,6 +489,7 @@ app.post('/send-message', async (req, res) => {
     
     const client = await pool.connect();
     try {
+      // إعادة توجيه إلى نفس المنطق
       const result = await client.query(
         `INSERT INTO messages (sender, receiver, content, media_type, media_url, reply_to) 
          VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
@@ -475,7 +521,7 @@ app.post('/send-message', async (req, res) => {
 
 // ============ إرسال رسالة (بديل آخر) ============
 app.post('/chat/send', async (req, res) => {
-  // نفس المنطق أعلاه
+  // نفس منطق /messages/send
   const { sender, receiver, content, mediaType, mediaUrl, replyTo } = req.body;
   const token = req.headers.authorization?.split(' ')[1];
   
@@ -614,7 +660,7 @@ app.post('/webrtc', async (req, res) => {
 // ============ WebSocket Server ============
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
-const clients = new Map(); // username -> Set of WebSockets
+const clients = new Map();
 
 wss.on('connection', (ws) => {
   let username = null;
@@ -629,7 +675,6 @@ wss.on('connection', (ws) => {
           const decoded = jwt.verify(data.token, JWT_SECRET);
           username = decoded.username;
           
-          // إضافة هذا الاتصال إلى مجموعة المستخدم
           if (!clients.has(username)) {
             clients.set(username, new Set());
           }
@@ -638,11 +683,10 @@ wss.on('connection', (ws) => {
           ws.send(JSON.stringify({ type: 'auth_ok' }));
           console.log(`✅ ${username} connected (${clients.get(username).size} devices)`);
           
-          // ==== إرسال البريد الوارد (Inbox) عند الاتصال ====
+          // إرسال البريد الوارد (Inbox)
           try {
             const client = await pool.connect();
             try {
-              // جلب الرسائل غير المقروءة للمستقبل
               const result = await client.query(
                 `SELECT * FROM messages WHERE 
                  receiver = $1 AND read = FALSE
@@ -652,8 +696,6 @@ wss.on('connection', (ws) => {
               
               if (result.rows.length > 0) {
                 console.log(`📬 Sending ${result.rows.length} offline messages to ${username}`);
-                
-                // إرسال كل رسالة على حدة
                 result.rows.forEach((msg) => {
                   ws.send(JSON.stringify({
                     type: 'message',
@@ -661,7 +703,6 @@ wss.on('connection', (ws) => {
                   }));
                 });
                 
-                // تحديث حالة delivered
                 await client.query(
                   `UPDATE messages SET delivered = TRUE 
                    WHERE receiver = $1 AND delivered = FALSE`,
@@ -682,7 +723,7 @@ wss.on('connection', (ws) => {
         return;
       }
       
-      // رسالة نصية عبر WebSocket
+      // رسالة عبر WebSocket
       if (data.type === 'message' && username) {
         const { receiver, content, mediaType, mediaUrl, replyTo } = data;
         
@@ -690,13 +731,41 @@ wss.on('connection', (ws) => {
         
         const client = await pool.connect();
         try {
-          const result = await client.query(
-            `INSERT INTO messages (sender, receiver, content, media_type, media_url, reply_to) 
-             VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-            [username, receiver, content || null, mediaType || null, mediaUrl || null, replyTo || null]
-          );
+          // التحقق من وجود الأعمدة ديناميكياً
+          const columnCheck = await client.query(`
+            SELECT column_name FROM information_schema.columns 
+            WHERE table_name = 'messages' AND column_name IN ('media_type', 'media_url', 'reply_to')
+          `);
+          const existingColumns = columnCheck.rows.map(row => row.column_name);
           
-          // إرسال للمستقبل إذا كان متصلاً
+          let insertQuery = 'INSERT INTO messages (sender, receiver, content';
+          let values = [username, receiver, content || null];
+          let valuePlaceholders = ['$1', '$2', '$3'];
+          let paramIndex = 4;
+          
+          if (existingColumns.includes('media_type') && mediaType) {
+            insertQuery += ', media_type';
+            values.push(mediaType);
+            valuePlaceholders.push(`$${paramIndex++}`);
+          }
+          
+          if (existingColumns.includes('media_url') && mediaUrl) {
+            insertQuery += ', media_url';
+            values.push(mediaUrl);
+            valuePlaceholders.push(`$${paramIndex++}`);
+          }
+          
+          if (existingColumns.includes('reply_to') && replyTo) {
+            insertQuery += ', reply_to';
+            values.push(replyTo);
+            valuePlaceholders.push(`$${paramIndex++}`);
+          }
+          
+          insertQuery += `) VALUES (${valuePlaceholders.join(', ')}) RETURNING *`;
+          
+          const result = await client.query(insertQuery, values);
+          
+          // إرسال للمستقبل
           const receiverSockets = clients.get(receiver);
           if (receiverSockets) {
             const messageData = JSON.stringify({
@@ -777,7 +846,6 @@ wss.on('connection', (ws) => {
   });
 });
 
-// بث قائمة المستخدمين المتصلين
 function broadcastOnlineUsers() {
   const onlineUsers = Array.from(clients.keys());
   const message = JSON.stringify({
@@ -796,7 +864,7 @@ function broadcastOnlineUsers() {
 
 // ============ تشغيل السيرفر ============
 const startServer = async () => {
-  console.log('🚀 Starting WorldChat Server v2.5.0...');
+  console.log('🚀 Starting WorldChat Server v2.5.1...');
   console.log('📡 DATABASE_URL:', DATABASE_URL ? 'Set ✅' : 'Missing ❌');
   console.log('🔐 JWT_SECRET:', JWT_SECRET ? 'Set ✅' : 'Missing ❌');
   
