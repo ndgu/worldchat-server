@@ -30,7 +30,7 @@ const pool = new Pool({
 
 const JWT_SECRET = process.env.JWT_SECRET || 'worldchat_super_secret_key_2026_ahmed_12345';
 
-// Create tables
+// ============ إنشاء الجداول ============
 const initDB = async () => {
   try {
     await pool.query(`
@@ -52,6 +52,8 @@ const initDB = async () => {
         media_type TEXT,
         media_url TEXT,
         reply_to INTEGER,
+        delivered BOOLEAN DEFAULT FALSE,
+        read BOOLEAN DEFAULT FALSE,
         timestamp TIMESTAMP DEFAULT NOW()
       );
     `);
@@ -73,7 +75,7 @@ const initDB = async () => {
   }
 };
 
-// Health check
+// ============ Health Check ============
 app.get('/health', async (req, res) => {
   let dbStatus = 'unknown';
   let usersCount = 0;
@@ -101,7 +103,7 @@ app.get('/health', async (req, res) => {
   });
 });
 
-// Register
+// ============ تسجيل حساب جديد ============
 app.post('/register', async (req, res) => {
   const { username, password, displayName, profilePic } = req.body;
   
@@ -142,7 +144,7 @@ app.post('/register', async (req, res) => {
   }
 });
 
-// Login
+// ============ تسجيل الدخول ============
 app.post('/login', async (req, res) => {
   const { username, password } = req.body;
   
@@ -179,7 +181,7 @@ app.post('/login', async (req, res) => {
   }
 });
 
-// Update profile
+// ============ تحديث الملف الشخصي ============
 app.post('/update-profile', async (req, res) => {
   const { username, displayName, profilePic, password } = req.body;
   const token = req.headers.authorization?.split(' ')[1];
@@ -219,9 +221,82 @@ app.post('/update-profile', async (req, res) => {
   }
 });
 
-// Get messages
+// ============ جلب معلومات المستخدم ============
+app.get('/me', async (req, res) => {
+  const token = req.headers.authorization?.split(' ')[1];
+  
+  if (!token) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const client = await pool.connect();
+    try {
+      const result = await client.query(
+        'SELECT username, display_name, profile_pic, created_at FROM users WHERE username = $1',
+        [decoded.username]
+      );
+      if (result.rows.length === 0) {
+        return res.status(404).json({ error: 'User not found' });
+      }
+      res.json(result.rows[0]);
+    } finally {
+      client.release();
+    }
+  } catch (e) {
+    console.error('Me error:', e.message);
+    res.status(500).json({ error: 'Server error: ' + e.message });
+  }
+});
+
+// ============ جلب قائمة المستخدمين ============
+app.get('/users', async (req, res) => {
+  try {
+    const client = await pool.connect();
+    try {
+      const result = await client.query(
+        'SELECT username, display_name, profile_pic FROM users ORDER BY username'
+      );
+      res.json(result.rows);
+    } finally {
+      client.release();
+    }
+  } catch (e) {
+    console.error('Users error:', e.message);
+    res.status(500).json({ error: 'Server error: ' + e.message });
+  }
+});
+
+// ============ البحث عن مستخدمين ============
+app.get('/users/search', async (req, res) => {
+  const { username } = req.query;
+  
+  if (!username) {
+    return res.status(400).json({ error: 'Username query param required' });
+  }
+  
+  try {
+    const client = await pool.connect();
+    try {
+      const result = await client.query(
+        `SELECT username, display_name, profile_pic FROM users 
+         WHERE username ILIKE $1 ORDER BY username LIMIT 20`,
+        [`%${username}%`]
+      );
+      res.json(result.rows);
+    } finally {
+      client.release();
+    }
+  } catch (e) {
+    console.error('Search error:', e.message);
+    res.status(500).json({ error: 'Server error: ' + e.message });
+  }
+});
+
+// ============ جلب رسائل المحادثة ============
 app.post('/messages', async (req, res) => {
-  const { myUsername, otherUsername } = req.body;
+  const { myUsername, otherUsername, limit = 50, offset = 0 } = req.body;
   
   if (!myUsername || !otherUsername) {
     return res.status(400).json({ error: 'Both usernames required' });
@@ -233,10 +308,11 @@ app.post('/messages', async (req, res) => {
       const result = await client.query(
         `SELECT * FROM messages WHERE 
          (sender = $1 AND receiver = $2) OR (sender = $2 AND receiver = $1)
-         ORDER BY timestamp ASC`,
-        [myUsername, otherUsername]
+         ORDER BY timestamp DESC LIMIT $3 OFFSET $4`,
+        [myUsername, otherUsername, limit, offset]
       );
-      res.json(result.rows);
+      // ترتيب تصاعدي للعرض
+      res.json(result.rows.reverse());
     } finally {
       client.release();
     }
@@ -246,32 +322,104 @@ app.post('/messages', async (req, res) => {
   }
 });
 
-// Get all users
-app.get('/users', async (req, res) => {
+// ============ إرسال رسالة ============
+app.post('/messages/send', async (req, res) => {
+  const { sender, receiver, content, mediaType, mediaUrl, replyTo } = req.body;
+  const token = req.headers.authorization?.split(' ')[1];
+  
+  if (!token) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  
   try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    if (decoded.username !== sender) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    
+    if (!receiver) {
+      return res.status(400).json({ error: 'Receiver required' });
+    }
+    
     const client = await pool.connect();
     try {
-      const result = await client.query('SELECT username, display_name, profile_pic FROM users ORDER BY username');
-      res.json(result.rows);
+      const result = await client.query(
+        `INSERT INTO messages (sender, receiver, content, media_type, media_url, reply_to) 
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+        [sender, receiver, content || null, mediaType || null, mediaUrl || null, replyTo || null]
+      );
+      
+      // إرسال عبر WebSocket للمستقبل إذا كان متصلاً
+      const receiverWs = clients.get(receiver);
+      if (receiverWs && receiverWs.readyState === WebSocket.OPEN) {
+        receiverWs.send(JSON.stringify({
+          type: 'message',
+          ...result.rows[0]
+        }));
+      }
+      
+      res.json(result.rows[0]);
     } finally {
       client.release();
     }
   } catch (e) {
-    console.error('Users error:', e.message);
+    console.error('Send message error:', e.message);
     res.status(500).json({ error: 'Server error: ' + e.message });
   }
 });
 
-// WebRTC Signaling
-app.post('/webrtc', async (req, res) => {
-  const { type, from, to, data } = req.body;
+// ============ تعليم الرسائل كمقروءة ============
+app.post('/messages/read', async (req, res) => {
+  const { username, otherUsername } = req.body;
+  const token = req.headers.authorization?.split(' ')[1];
   
-  if (!type || !from || !to) {
-    return res.status(400).json({ error: 'Missing fields' });
+  if (!token) {
+    return res.status(401).json({ error: 'Unauthorized' });
   }
   
   try {
-    // Save call record
+    const decoded = jwt.verify(token, JWT_SECRET);
+    if (decoded.username !== username) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    
+    const client = await pool.connect();
+    try {
+      await client.query(
+        `UPDATE messages SET read = TRUE, delivered = TRUE 
+         WHERE sender = $1 AND receiver = $2 AND read = FALSE`,
+        [otherUsername, username]
+      );
+      res.json({ success: true });
+    } finally {
+      client.release();
+    }
+  } catch (e) {
+    console.error('Read error:', e.message);
+    res.status(500).json({ error: 'Server error: ' + e.message });
+  }
+});
+
+// ============ WebRTC Signaling ============
+app.post('/webrtc', async (req, res) => {
+  const { type, from, to, data } = req.body;
+  const token = req.headers.authorization?.split(' ')[1];
+  
+  if (!token) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    if (decoded.username !== from) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    
+    if (!type || !from || !to) {
+      return res.status(400).json({ error: 'Missing fields' });
+    }
+    
+    // حفظ سجل المكالمة
     if (type === 'call-start') {
       await pool.query(
         'INSERT INTO calls (caller, receiver, status) VALUES ($1, $2, $3)',
@@ -281,22 +429,32 @@ app.post('/webrtc', async (req, res) => {
     
     if (type === 'call-end') {
       await pool.query(
-        'UPDATE calls SET status = $1, ended_at = NOW() WHERE caller = $2 AND receiver = $3 AND ended_at IS NULL',
+        `UPDATE calls SET status = $1, ended_at = NOW() 
+         WHERE caller = $2 AND receiver = $3 AND ended_at IS NULL`,
         ['ended', from, to]
       );
+    }
+    
+    // إعادة توجيه إشارة WebRTC عبر WebSocket
+    const targetWs = clients.get(to);
+    if (targetWs && targetWs.readyState === WebSocket.OPEN) {
+      targetWs.send(JSON.stringify({
+        type: 'webrtc',
+        from: from,
+        signal: data
+      }));
     }
     
     res.json({ success: true });
   } catch (e) {
     console.error('WebRTC error:', e.message);
-    res.status(500).json({ error: 'Server error' });
+    res.status(500).json({ error: 'Server error: ' + e.message });
   }
 });
 
-// WebSocket Server
+// ============ WebSocket Server ============
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
-
 const clients = new Map();
 
 wss.on('connection', (ws) => {
@@ -306,6 +464,7 @@ wss.on('connection', (ws) => {
     try {
       const data = JSON.parse(message);
       
+      // مصادقة
       if (data.type === 'auth') {
         try {
           const decoded = jwt.verify(data.token, JWT_SECRET);
@@ -313,11 +472,16 @@ wss.on('connection', (ws) => {
           clients.set(username, ws);
           ws.send(JSON.stringify({ type: 'auth_ok' }));
           console.log(`✅ ${username} connected`);
+          
+          // إرسال قائمة المستخدمين المتصلين
+          const onlineUsers = Array.from(clients.keys());
+          broadcastOnlineUsers();
         } catch (e) {
           ws.send(JSON.stringify({ type: 'auth_fail' }));
         }
       }
       
+      // رسالة نصية
       if (data.type === 'message' && username) {
         const { receiver, content, mediaType, mediaUrl, replyTo } = data;
         
@@ -325,30 +489,25 @@ wss.on('connection', (ws) => {
         
         const client = await pool.connect();
         try {
-          await client.query(
+          const result = await client.query(
             `INSERT INTO messages (sender, receiver, content, media_type, media_url, reply_to) 
-             VALUES ($1, $2, $3, $4, $5, $6)`,
+             VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
             [username, receiver, content || null, mediaType || null, mediaUrl || null, replyTo || null]
           );
+          
+          // إرسال للمستقبل إذا كان متصلاً
+          const receiverWs = clients.get(receiver);
+          if (receiverWs && receiverWs.readyState === WebSocket.OPEN) {
+            receiverWs.send(JSON.stringify({
+              type: 'message',
+              ...result.rows[0]
+            }));
+          }
+          
+          ws.send(JSON.stringify({ type: 'sent', messageId: result.rows[0].id }));
         } finally {
           client.release();
         }
-        
-        // Send to receiver if online
-        const receiverWs = clients.get(receiver);
-        if (receiverWs && receiverWs.readyState === WebSocket.OPEN) {
-          receiverWs.send(JSON.stringify({
-            type: 'message',
-            sender: username,
-            content: content || null,
-            mediaType: mediaType || null,
-            mediaUrl: mediaUrl || null,
-            replyTo: replyTo || null,
-            timestamp: new Date().toISOString()
-          }));
-        }
-        
-        ws.send(JSON.stringify({ type: 'sent' }));
       }
       
       // WebRTC Signaling
@@ -364,6 +523,18 @@ wss.on('connection', (ws) => {
         }
       }
       
+      // مؤشر الكتابة
+      if (data.type === 'typing' && username) {
+        const { to } = data;
+        const targetWs = clients.get(to);
+        if (targetWs && targetWs.readyState === WebSocket.OPEN) {
+          targetWs.send(JSON.stringify({
+            type: 'typing',
+            from: username
+          }));
+        }
+      }
+      
     } catch (e) {
       console.error('❌ WS error:', e.message);
     }
@@ -373,11 +544,27 @@ wss.on('connection', (ws) => {
     if (username) {
       clients.delete(username);
       console.log(`❌ ${username} disconnected`);
+      broadcastOnlineUsers();
     }
   });
 });
 
-// Start server
+// بث قائمة المستخدمين المتصلين
+function broadcastOnlineUsers() {
+  const onlineUsers = Array.from(clients.keys());
+  const message = JSON.stringify({
+    type: 'online_users',
+    users: onlineUsers
+  });
+  
+  clients.forEach((ws) => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(message);
+    }
+  });
+}
+
+// ============ تشغيل السيرفر ============
 const startServer = async () => {
   console.log('🚀 Starting WorldChat Server v2.2...');
   console.log('📡 DATABASE_URL:', DATABASE_URL ? 'Set ✅' : 'Missing ❌');
