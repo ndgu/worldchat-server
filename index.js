@@ -29,7 +29,7 @@ const pool = new Pool({
 const JWT_SECRET = process.env.JWT_SECRET || 'worldchat_super_secret_key_2026_ahmed_12345';
 
 // ============================================================
-// ============ FIREBASE ADMIN SDK (المُصلح) ============
+// ============ FIREBASE ADMIN SDK (من الملف) ============
 // ============================================================
 
 let admin = null;
@@ -40,36 +40,44 @@ let firebaseInitialized = false;
 try {
   admin = require('firebase-admin');
   
-  const projectId = process.env.FIREBASE_PROJECT_ID;
-  const privateKey = process.env.FIREBASE_PRIVATE_KEY;
-  const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
+  // محاولة تحميل المفتاح من ملف
+  let serviceAccount = null;
   
-  console.log('📡 Checking Firebase variables...');
-  console.log('  - FIREBASE_PROJECT_ID:', projectId ? '✅ Set' : '❌ Missing');
-  console.log('  - FIREBASE_PRIVATE_KEY:', privateKey ? '✅ Set (' + privateKey.length + ' chars)' : '❌ Missing');
-  console.log('  - FIREBASE_CLIENT_EMAIL:', clientEmail ? '✅ Set' : '❌ Missing');
-  
-  if (projectId && privateKey && clientEmail) {
-    console.log('🔥 Initializing Firebase Admin...');
+  try {
+    // من ملف firebase-key.json في نفس المجلد
+    serviceAccount = require('./firebase-key.json');
+    console.log('📁 Firebase key loaded from file');
+  } catch (e) {
+    console.log('⚠️ Firebase key file not found, trying environment variables');
     
-    let formattedPrivateKey = privateKey;
-    if (formattedPrivateKey.includes('\\n')) {
-      formattedPrivateKey = formattedPrivateKey.replace(/\\n/g, '\n');
+    // الاحتياط: استخدام متغيرات البيئة
+    const projectId = process.env.FIREBASE_PROJECT_ID;
+    const privateKey = process.env.FIREBASE_PRIVATE_KEY;
+    const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
+    
+    if (projectId && privateKey && clientEmail) {
+      let formattedPrivateKey = privateKey;
+      if (formattedPrivateKey.includes('\\n')) {
+        formattedPrivateKey = formattedPrivateKey.replace(/\\n/g, '\n');
+      }
+      
+      serviceAccount = {
+        type: "service_account",
+        project_id: projectId,
+        private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID || "",
+        private_key: formattedPrivateKey,
+        client_email: clientEmail,
+        client_id: process.env.FIREBASE_CLIENT_ID || "",
+        auth_uri: "https://accounts.google.com/o/oauth2/auth",
+        token_uri: "https://oauth2.googleapis.com/token",
+        auth_provider_x509_cert_url: "https://www.googleapis.com/oauth2/v1/certs",
+        client_x509_cert_url: process.env.FIREBASE_CLIENT_CERT_URL || ""
+      };
+      console.log('📡 Firebase initialized from environment variables');
     }
-    
-    const serviceAccount = {
-      type: "service_account",
-      project_id: projectId,
-      private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID || "",
-      private_key: formattedPrivateKey,
-      client_email: clientEmail,
-      client_id: process.env.FIREBASE_CLIENT_ID || "",
-      auth_uri: "https://accounts.google.com/o/oauth2/auth",
-      token_uri: "https://oauth2.googleapis.com/token",
-      auth_provider_x509_cert_url: "https://www.googleapis.com/oauth2/v1/certs",
-      client_x509_cert_url: process.env.FIREBASE_CLIENT_CERT_URL || ""
-    };
-
+  }
+  
+  if (serviceAccount) {
     admin.initializeApp({
       credential: admin.credential.cert(serviceAccount),
       storageBucket: process.env.FIREBASE_STORAGE_BUCKET || 'worldchat-cde0b.firebasestorage.app'
@@ -81,12 +89,84 @@ try {
     console.log('✅ Firebase Admin initialized successfully!');
     console.log('📦 Storage Bucket:', bucket.name);
   } else {
-    console.log('⚠️ Firebase variables missing - FCM and Storage disabled');
+    console.log('⚠️ No Firebase credentials found');
   }
 } catch (e) {
   console.log('❌ Firebase init error:', e.message);
   firebaseInitialized = false;
 }
+
+// ============================================================
+// ============ FCM - إرسال الإشعارات ============
+// ============================================================
+
+const sendFCMNotification = async (toUsername, title, body, data = {}) => {
+  if (!firebaseInitialized || !fcm) {
+    console.log('ℹ️ Firebase not initialized, skipping notification');
+    return;
+  }
+  
+  try {
+    const client = await pool.connect();
+    try {
+      const result = await client.query(
+        `SELECT fcm_token FROM devices WHERE username = $1`,
+        [toUsername]
+      );
+      
+      const tokens = result.rows.map(row => row.fcm_token);
+      if (tokens.length === 0) {
+        console.log(`📱 No devices registered for ${toUsername}`);
+        return;
+      }
+
+      const stringData = {};
+      for (const [key, value] of Object.entries(data)) {
+        stringData[key] = String(value);
+      }
+
+      const message = {
+        tokens: tokens,
+        notification: { title, body },
+        data: stringData,
+        android: {
+          priority: 'high',
+          notification: {
+            sound: 'default',
+            clickAction: 'OPEN_ACTIVITY'
+          }
+        }
+      };
+
+      const response = await fcm.sendEachForMulticast(message);
+      console.log(`📨 FCM sent to ${toUsername}: ${response.successCount} delivered`);
+
+      const staleTokens = [];
+      response.responses.forEach((resp, index) => {
+        if (resp.error && resp.error.message.includes('registration-token-not-registered')) {
+          staleTokens.push(tokens[index]);
+        }
+      });
+
+      if (staleTokens.length > 0) {
+        const client2 = await pool.connect();
+        try {
+          await client2.query(
+            `DELETE FROM devices WHERE fcm_token = ANY($1)`,
+            [staleTokens]
+          );
+          console.log(`🧹 Cleaned ${staleTokens.length} stale FCM tokens`);
+        } finally {
+          client2.release();
+        }
+      }
+    } finally {
+      client.release();
+    }
+  } catch (e) {
+    console.error('FCM error:', e.message);
+  }
+};
 
 // ============================================================
 // ============ إنشاء الجداول ============
@@ -176,78 +256,6 @@ const initDB = async () => {
 };
 
 // ============================================================
-// ============ FCM - إرسال الإشعارات ============
-// ============================================================
-
-const sendFCMNotification = async (toUsername, title, body, data = {}) => {
-  if (!firebaseInitialized || !fcm) {
-    console.log('ℹ️ Firebase not initialized, skipping notification to', toUsername);
-    return;
-  }
-  
-  try {
-    const client = await pool.connect();
-    try {
-      const result = await client.query(
-        `SELECT fcm_token FROM devices WHERE username = $1`,
-        [toUsername]
-      );
-      
-      const tokens = result.rows.map(row => row.fcm_token);
-      if (tokens.length === 0) {
-        console.log(`📱 No devices registered for ${toUsername}`);
-        return;
-      }
-
-      const stringData = {};
-      for (const [key, value] of Object.entries(data)) {
-        stringData[key] = String(value);
-      }
-
-      const message = {
-        tokens: tokens,
-        notification: { title, body },
-        data: stringData,
-        android: {
-          priority: 'high',
-          notification: {
-            sound: 'default',
-            clickAction: 'OPEN_ACTIVITY'
-          }
-        }
-      };
-
-      const response = await fcm.sendEachForMulticast(message);
-      console.log(`📨 FCM sent to ${toUsername}: ${response.successCount} delivered`);
-
-      const staleTokens = [];
-      response.responses.forEach((resp, index) => {
-        if (resp.error && resp.error.message.includes('registration-token-not-registered')) {
-          staleTokens.push(tokens[index]);
-        }
-      });
-
-      if (staleTokens.length > 0) {
-        const client2 = await pool.connect();
-        try {
-          await client2.query(
-            `DELETE FROM devices WHERE fcm_token = ANY($1)`,
-            [staleTokens]
-          );
-          console.log(`🧹 Cleaned ${staleTokens.length} stale FCM tokens`);
-        } finally {
-          client2.release();
-        }
-      }
-    } finally {
-      client.release();
-    }
-  } catch (e) {
-    console.error('FCM error:', e.message);
-  }
-};
-
-// ============================================================
 // ============ HEALTH CHECK ============
 // ============================================================
 
@@ -280,7 +288,7 @@ app.get('/health', async (req, res) => {
 });
 
 // ============================================================
-// ============ UPLOAD - رفع الملفات إلى Firebase Storage ============
+// ============ UPLOAD - رفع الملفات إلى Firebase ============
 // ============================================================
 
 const upload = multer({ storage: multer.memoryStorage() });
