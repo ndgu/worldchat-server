@@ -29,7 +29,6 @@ const JWT_SECRET = process.env.JWT_SECRET || 'worldchat_super_secret_key_2026_ah
 // ============ إنشاء الجداول وتحديثها ============
 const initDB = async () => {
   try {
-    // إنشاء جدول users
     await pool.query(`
       CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
@@ -42,23 +41,17 @@ const initDB = async () => {
       );
     `);
 
-    // إضافة الأعمدة المفقودة (للتوافق مع الإصدارات السابقة)
+    // إضافة الأعمدة المفقودة
     try {
       await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name TEXT;`);
-      console.log('✅ Column display_name added');
-    } catch (e) { /* العمود موجود */ }
-
+    } catch (e) {}
     try {
       await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar TEXT;`);
-      console.log('✅ Column avatar added');
-    } catch (e) { /* العمود موجود */ }
-
+    } catch (e) {}
     try {
       await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_pic TEXT;`);
-      console.log('✅ Column profile_pic added');
-    } catch (e) { /* العمود موجود */ }
+    } catch (e) {}
 
-    // جدول messages
     await pool.query(`
       CREATE TABLE IF NOT EXISTS messages (
         id SERIAL PRIMARY KEY,
@@ -74,7 +67,6 @@ const initDB = async () => {
       );
     `);
 
-    // جدول calls
     await pool.query(`
       CREATE TABLE IF NOT EXISTS calls (
         id SERIAL PRIMARY KEY,
@@ -86,7 +78,7 @@ const initDB = async () => {
       );
     `);
 
-    console.log('✅ Database tables ready (v2.3.0)');
+    console.log('✅ Database tables ready (v2.4.0)');
     return true;
   } catch (err) {
     console.error('❌ DB init error:', err.message);
@@ -115,7 +107,7 @@ app.get('/health', async (req, res) => {
   res.json({
     ok: true,
     service: 'worldchat',
-    version: '2.3.0',
+    version: '2.4.0',
     db: dbStatus,
     usersCount: usersCount,
     features: ['chat', 'media', 'profile', 'calls']
@@ -147,7 +139,6 @@ app.post('/register', async (req, res) => {
       }
       
       const hashed = await bcrypt.hash(password, 10);
-      // نحفظ البيانات الأساسية أولاً
       await client.query(
         'INSERT INTO users (username, password, display_name, profile_pic) VALUES ($1, $2, $3, $4)',
         [username, hashed, displayName || username, profilePic || null]
@@ -341,8 +332,99 @@ app.post('/messages', async (req, res) => {
   }
 });
 
-// ============ إرسال رسالة ============
+// ============ إرسال رسالة (HTTP) ============
 app.post('/messages/send', async (req, res) => {
+  const { sender, receiver, content, mediaType, mediaUrl, replyTo } = req.body;
+  const token = req.headers.authorization?.split(' ')[1];
+  
+  if (!token) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    if (decoded.username !== sender) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    
+    if (!receiver) {
+      return res.status(400).json({ error: 'Receiver required' });
+    }
+    
+    const client = await pool.connect();
+    try {
+      const result = await client.query(
+        `INSERT INTO messages (sender, receiver, content, media_type, media_url, reply_to) 
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+        [sender, receiver, content || null, mediaType || null, mediaUrl || null, replyTo || null]
+      );
+      
+      // إرسال عبر WebSocket للمستقبل إذا كان متصلاً
+      const receiverWs = clients.get(receiver);
+      if (receiverWs && receiverWs.readyState === WebSocket.OPEN) {
+        receiverWs.send(JSON.stringify({
+          type: 'message',
+          ...result.rows[0]
+        }));
+      }
+      
+      res.json(result.rows[0]);
+    } finally {
+      client.release();
+    }
+  } catch (e) {
+    console.error('Send message error:', e.message);
+    res.status(500).json({ error: 'Server error: ' + e.message });
+  }
+});
+
+// ============ إرسال رسالة (HTTP بديل) ============
+app.post('/send-message', async (req, res) => {
+  const { sender, receiver, content, mediaType, mediaUrl, replyTo } = req.body;
+  const token = req.headers.authorization?.split(' ')[1];
+  
+  if (!token) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    if (decoded.username !== sender) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    
+    if (!receiver) {
+      return res.status(400).json({ error: 'Receiver required' });
+    }
+    
+    const client = await pool.connect();
+    try {
+      const result = await client.query(
+        `INSERT INTO messages (sender, receiver, content, media_type, media_url, reply_to) 
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+        [sender, receiver, content || null, mediaType || null, mediaUrl || null, replyTo || null]
+      );
+      
+      const receiverWs = clients.get(receiver);
+      if (receiverWs && receiverWs.readyState === WebSocket.OPEN) {
+        receiverWs.send(JSON.stringify({
+          type: 'message',
+          ...result.rows[0]
+        }));
+      }
+      
+      res.json(result.rows[0]);
+    } finally {
+      client.release();
+    }
+  } catch (e) {
+    console.error('Send message error:', e.message);
+    res.status(500).json({ error: 'Server error: ' + e.message });
+  }
+});
+
+// ============ إرسال رسالة (HTTP بديل آخر) ============
+app.post('/chat/send', async (req, res) => {
   const { sender, receiver, content, mediaType, mediaUrl, replyTo } = req.body;
   const token = req.headers.authorization?.split(' ')[1];
   
@@ -471,7 +553,7 @@ app.post('/webrtc', async (req, res) => {
 // ============ WebSocket Server ============
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
-const clients = new Map();
+const clients = new Map(); // username -> Set of WebSockets (يدعم عدة أجهزة)
 
 wss.on('connection', (ws) => {
   let username = null;
@@ -480,19 +562,28 @@ wss.on('connection', (ws) => {
     try {
       const data = JSON.parse(message);
       
+      // مصادقة
       if (data.type === 'auth') {
         try {
           const decoded = jwt.verify(data.token, JWT_SECRET);
           username = decoded.username;
-          clients.set(username, ws);
+          
+          // إضافة هذا الاتصال إلى مجموعة المستخدم
+          if (!clients.has(username)) {
+            clients.set(username, new Set());
+          }
+          clients.get(username).add(ws);
+          
           ws.send(JSON.stringify({ type: 'auth_ok' }));
-          console.log(`✅ ${username} connected`);
+          console.log(`✅ ${username} connected (${clients.get(username).size} devices)`);
           broadcastOnlineUsers();
         } catch (e) {
           ws.send(JSON.stringify({ type: 'auth_fail' }));
         }
+        return;
       }
       
+      // رسالة نصية عبر WebSocket
       if (data.type === 'message' && username) {
         const { receiver, content, mediaType, mediaUrl, replyTo } = data;
         
@@ -506,57 +597,88 @@ wss.on('connection', (ws) => {
             [username, receiver, content || null, mediaType || null, mediaUrl || null, replyTo || null]
           );
           
-          const receiverWs = clients.get(receiver);
-          if (receiverWs && receiverWs.readyState === WebSocket.OPEN) {
-            receiverWs.send(JSON.stringify({
+          // إرسال للمستقبل إذا كان متصلاً (جميع أجهزته)
+          const receiverSockets = clients.get(receiver);
+          if (receiverSockets) {
+            const messageData = JSON.stringify({
               type: 'message',
               ...result.rows[0]
-            }));
+            });
+            receiverSockets.forEach((socket) => {
+              if (socket.readyState === WebSocket.OPEN) {
+                socket.send(messageData);
+              }
+            });
           }
           
           ws.send(JSON.stringify({ type: 'sent', messageId: result.rows[0].id }));
         } finally {
           client.release();
         }
+        return;
       }
       
+      // WebRTC Signaling
       if (data.type === 'webrtc' && username) {
         const { to, signal } = data;
-        const targetWs = clients.get(to);
-        if (targetWs && targetWs.readyState === WebSocket.OPEN) {
-          targetWs.send(JSON.stringify({
+        const receiverSockets = clients.get(to);
+        if (receiverSockets) {
+          const signalData = JSON.stringify({
             type: 'webrtc',
             from: username,
             signal: signal
-          }));
+          });
+          receiverSockets.forEach((socket) => {
+            if (socket.readyState === WebSocket.OPEN) {
+              socket.send(signalData);
+            }
+          });
         }
+        return;
       }
       
+      // مؤشر الكتابة
       if (data.type === 'typing' && username) {
         const { to } = data;
-        const targetWs = clients.get(to);
-        if (targetWs && targetWs.readyState === WebSocket.OPEN) {
-          targetWs.send(JSON.stringify({
+        const receiverSockets = clients.get(to);
+        if (receiverSockets) {
+          const typingData = JSON.stringify({
             type: 'typing',
             from: username
-          }));
+          });
+          receiverSockets.forEach((socket) => {
+            if (socket.readyState === WebSocket.OPEN) {
+              socket.send(typingData);
+            }
+          });
         }
+        return;
       }
       
     } catch (e) {
       console.error('❌ WS error:', e.message);
+      ws.send(JSON.stringify({ type: 'error', message: e.message }));
     }
   });
 
   ws.on('close', () => {
     if (username) {
-      clients.delete(username);
-      console.log(`❌ ${username} disconnected`);
+      const userSockets = clients.get(username);
+      if (userSockets) {
+        userSockets.delete(ws);
+        if (userSockets.size === 0) {
+          clients.delete(username);
+          console.log(`❌ ${username} disconnected (no devices left)`);
+        } else {
+          console.log(`❌ ${username} device disconnected (${userSockets.size} devices remain)`);
+        }
+      }
       broadcastOnlineUsers();
     }
   });
 });
 
+// بث قائمة المستخدمين المتصلين
 function broadcastOnlineUsers() {
   const onlineUsers = Array.from(clients.keys());
   const message = JSON.stringify({
@@ -564,16 +686,18 @@ function broadcastOnlineUsers() {
     users: onlineUsers
   });
   
-  clients.forEach((ws) => {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(message);
-    }
+  clients.forEach((sockets) => {
+    sockets.forEach((ws) => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(message);
+      }
+    });
   });
 }
 
 // ============ تشغيل السيرفر ============
 const startServer = async () => {
-  console.log('🚀 Starting WorldChat Server v2.3.0...');
+  console.log('🚀 Starting WorldChat Server v2.4.0...');
   console.log('📡 DATABASE_URL:', DATABASE_URL ? 'Set ✅' : 'Missing ❌');
   console.log('🔐 JWT_SECRET:', JWT_SECRET ? 'Set ✅' : 'Missing ❌');
   
@@ -583,6 +707,7 @@ const startServer = async () => {
     console.log(`🚀 Server running on port ${port}`);
     console.log(`📊 DB Status: ${dbReady ? 'ready ✅' : 'not ready ❌'}`);
     console.log('✨ Features: chat, media, profile, calls');
+    console.log('👥 Multi-device support: enabled');
   });
 };
 
